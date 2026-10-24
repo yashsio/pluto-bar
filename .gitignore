@@ -1,0 +1,4 @@
+pluto-bar
+*.o
+protocols/
+result
