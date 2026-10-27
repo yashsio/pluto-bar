@@ -1,4 +1,5 @@
 pluto-bar
+pluto-status
 *.o
 protocols/
 result

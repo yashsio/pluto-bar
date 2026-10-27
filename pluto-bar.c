@@ -55,6 +55,7 @@ struct Monitor {
 	size_t size;
 	Drw *drw;
 	int width, height;
+	int tagw[LENGTH(tags)];
 	int configured;
 	unsigned int tagset;      /* bit i = tag i is selected */
 	unsigned int occ;         /* bit i = tag i has clients */
@@ -71,6 +72,7 @@ static int lrpad;                 /* left/right padding for text */
 static char stext[512];           /* status text */
 static Clr **scheme;
 static int running = 1;
+static int timer_fd = -1;
 
 /* wayland */
 static struct wl_display *dpy;
@@ -142,6 +144,60 @@ draw_all(void)
 
 	for (m = mons; m; m = m->next)
 		draw_bar(m);
+}
+
+/* Only the focused monitor displays the status text, so a status-only
+ * update has no reason to repaint the other monitors. */
+static void
+draw_status(void)
+{
+	Monitor *m;
+
+	for (m = mons; m; m = m->next)
+		if (m->focused)
+			draw_bar(m);
+}
+
+static void
+bar_timer_arm(int ms)
+{
+	struct itimerspec its;
+
+	memset(&its, 0, sizeof its);
+	if (ms > 0) {
+		its.it_value.tv_sec = ms / 1000;
+		its.it_value.tv_nsec = (long)(ms % 1000) * 1000000L;
+		if (!its.it_value.tv_sec && !its.it_value.tv_nsec)
+			its.it_value.tv_nsec = 1;
+	}
+	if (timer_fd >= 0)
+		timerfd_settime(timer_fd, 0, &its, NULL);
+}
+
+/*
+ * The clock fallback needs a one-second tick.  Once status comes from
+ * stdin there is nothing to tick; only a disconnected WM socket needs a
+ * slow reconnect retry.  A zero interval leaves poll() asleep.
+ */
+static void
+bar_timer_update(void)
+{
+	if (timer_fd < 0)
+		return;
+
+	if (!status_from_stdin) {
+		bar_timer_arm(1000);
+		return;
+	}
+	if (backend == BackendHyprland && hypr_available && hypr_fd < 0) {
+		bar_timer_arm(5000);
+		return;
+	}
+	if (backend == BackendRiver && river_fd < 0) {
+		bar_timer_arm(5000);
+		return;
+	}
+	bar_timer_arm(0);
 }
 
 /* -------------------------------------------------------------------------
@@ -451,6 +507,7 @@ hypr_read_events(void)
 			close(hypr_fd);
 			hypr_fd = -1;
 			hypr_line_len = 0;
+			bar_timer_update();
 			return;
 		} else {
 			if (errno == EINTR)
@@ -460,6 +517,7 @@ hypr_read_events(void)
 			close(hypr_fd);
 			hypr_fd = -1;
 			hypr_line_len = 0;
+			bar_timer_update();
 			return;
 		}
 	}
@@ -570,6 +628,7 @@ river_send(const char *fmt, ...)
 				return;
 			close(river_fd);
 			river_fd = -1;
+			bar_timer_update();
 			return;
 		}
 		off += (size_t)written;
@@ -652,6 +711,7 @@ river_read_events(void)
 			river_fd = -1;
 			river_line_len = 0;
 			river_in_snapshot = 0;
+			bar_timer_update();
 			return;
 		} else {
 			if (errno == EINTR)
@@ -662,6 +722,7 @@ river_read_events(void)
 			river_fd = -1;
 			river_line_len = 0;
 			river_in_snapshot = 0;
+			bar_timer_update();
 			return;
 		}
 	}
@@ -695,16 +756,19 @@ update_clock(void)
 	if (strcmp(buf, stext) == 0)
 		return;
 	snprintf(stext, sizeof stext, "%s", buf);
-	draw_all();
+	draw_status();
 }
 
 static void
 read_status(void)
 {
 	char buf[1024];
+	char prev[sizeof stext];
 	ssize_t n;
 	size_t i;
 	int got = 0;
+
+	snprintf(prev, sizeof prev, "%s", stext);
 
 	for (;;) {
 		n = read(STDIN_FILENO, buf, sizeof buf);
@@ -741,8 +805,15 @@ read_status(void)
 	}
 
 	if (got) {
+		int first = !status_from_stdin;
+
 		status_from_stdin = 1;
-		draw_all();
+		if (first)
+			bar_timer_update();
+		/* A status generator that prints every second would otherwise
+		 * force a full-width repaint even when the text is unchanged. */
+		if (strcmp(stext, prev) != 0)
+			draw_status();
 	}
 }
 
@@ -772,7 +843,7 @@ tag_click(Monitor *m, int x)
 		return;
 
 	for (i = 0; i < LENGTH(tags); i++) {
-		w = lrpad + drw_text_width(m->drw, tags[i]);
+		w = m->tagw[i];
 		if (x >= (int)tx && x < (int)(tx + w)) {
 			if (!(m->tagset & (1u << i))) {
 				if (backend == BackendRiver) {
@@ -832,7 +903,7 @@ draw_bar(Monitor *m)
 
 	x = 0;
 	for (i = 0; i < LENGTH(tags); i++) {
-		w = lrpad + drw_text_width(drw, tags[i]);
+		w = m->tagw[i];
 		drw_setscheme(drw,
 		    scheme[(m->tagset & (1u << i)) ? SchemeSel : SchemeNorm]);
 		drw_text(drw, x, 0, w, m->height, lrpad / 2, tags[i], 0);
@@ -885,7 +956,7 @@ static void
 create_buffer(Monitor *m)
 {
 	int pw, ph, stride;
-	size_t size;
+	size_t i, size;
 	struct wl_shm_pool *pool;
 	void *data;
 	int fd;
@@ -923,6 +994,13 @@ create_buffer(Monitor *m)
 
 	wl_surface_set_buffer_scale(m->surface, m->scale);
 	m->drw = drw_create(m->width, m->height, m->scale, data, stride, font);
+
+	/* Tags and font are compile-time constants, so measure them once. */
+	if (m->drw) {
+		for (i = 0; i < LENGTH(tags); i++)
+			m->tagw[i] = lrpad +
+			    drw_text_width(m->drw, tags[i]);
+	}
 }
 
 static void
@@ -1257,7 +1335,7 @@ static const struct wl_seat_listener seat_listener = {
 static void
 tick(void)
 {
-	if (backend == BackendHyprland && !hypr_fd && hypr_available) {
+	if (backend == BackendHyprland && hypr_fd < 0 && hypr_available) {
 		hypr_fd = hypr_connect();
 		if (hypr_fd >= 0)
 			dirty = 1;
@@ -1267,14 +1345,14 @@ tick(void)
 		river_connect();
 
 	update_clock();
+	bar_timer_update();
 }
 
 int
 main(void)
 {
-	struct itimerspec its;
 	struct pollfd fds[5];
-	int timer_fd, nfds, i;
+	int nfds, i;
 	Monitor *m;
 	int font_h;
 
@@ -1334,11 +1412,7 @@ main(void)
 	timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
 	if (timer_fd < 0)
 		die("pluto-bar: timerfd_create: %s\n", strerror(errno));
-	its.it_value.tv_sec = 1;
-	its.it_value.tv_nsec = 0;
-	its.it_interval = its.it_value;
-	if (timerfd_settime(timer_fd, 0, &its, NULL) < 0)
-		die("pluto-bar: timerfd_settime: %s\n", strerror(errno));
+	bar_timer_arm(1000);
 
 	if (backend == BackendHyprland) {
 		hypr_fd = hypr_connect();
