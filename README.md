@@ -38,8 +38,12 @@ short interval on missing hardware cannot cause wakeups.  Audio is polled
 only when `wpctl` exists, or read from libpulse events when connected.  Wifi
 keeps its normal off symbol, but rediscovery is limited to
 `WIFI_RETRY_INTERVAL` seconds instead of sampling every `WIFI_INTERVAL`, so
-a hotplugged interface still appears.  Bluetooth keeps its off symbol when
-`bluetoothctl` is missing; no helper process runs in that case.
+a hotplugged interface still appears.  Interfaces are found through
+`/proc/net/wireless` and `/sys/class/net`, so cfg80211 drivers that do not
+populate the WEXT file are still detected; when the link is associated but
+no signal level is exposed, the full-strength symbol is shown.  Bluetooth
+keeps its off symbol when `bluetoothctl` is missing; no helper process runs
+in that case.
 
 Audio and music use event sources when available:
 

@@ -91,7 +91,10 @@ static const int VOL_LOW_THRESHOLD = 50;
  * entirely, so their intervals cannot create wakeups.  Audio is scheduled
  * only when libpulse is ready or wpctl exists.  Wifi is the exception: it
  * keeps its "off" field and is rediscovered every WIFI_RETRY_INTERVAL
- * seconds so a hotplugged interface still appears. */
+ * seconds so a hotplugged interface still appears.  Interfaces are found
+ * through /proc/net/wireless and /sys/class/net, so cfg80211 drivers without
+ * WEXT support are detected too; if the link is associated but the signal
+ * level is unknown, the full-strength symbol is used. */
 static const int CPU_INTERVAL = 2;
 static const int RAM_INTERVAL = 2;
 static const int HOME_INTERVAL = 10;
