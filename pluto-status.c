@@ -87,12 +87,9 @@ struct module_state {
 };
 static struct module_state mstate[MOD_COUNT];
 
-/* wifi-specific state that doesn't map cleanly */
-static long long wifi_sample_next;
-static const char *wifi_symbol;
-static int wifi_failures;
-static long long wifi_next;
-static int wifi_valid;
+/* network module state */
+static int net_connected;
+static int net_valid;
 
 static int temp_missing;
 static int battery_missing;
@@ -983,14 +980,15 @@ get_home_gb(unsigned long long *gb)
 }
 
 static int
-get_uptime_hours(unsigned long long *hours)
+get_uptime_hours_minutes(unsigned long long *hours, unsigned long long *minutes)
 {
 	struct sysinfo si;
 
 	if (sysinfo(&si) != 0)
 		return -1;
 
-	*hours = (unsigned long long)si.uptime / 3600;
+	*hours = (unsigned long long)si.uptime / 3600ULL;
+	*minutes = ((unsigned long long)si.uptime / 60ULL) % 60ULL;
 	return 0;
 }
 
@@ -1137,7 +1135,7 @@ module_interval(int id)
 	case MOD_RAM:
 	case MOD_BRIGHT:
 		return 2;
-	case MOD_WIFI:
+	case MOD_NETWORK:
 	case MOD_TEMP:
 		return 5;
 	case MOD_HOME:
@@ -1159,85 +1157,17 @@ static const char *
 module_symbol(int id)
 {
 	switch (id) {
-	case MOD_CPU:    return SYM_CPU;
-	case MOD_RAM:    return SYM_RAM;
-	case MOD_TEMP:   return SYM_TEMP;
-	case MOD_HOME:   return SYM_HOME;
-	case MOD_UPTIME: return SYM_UPTIME;
-	case MOD_BRIGHT: return SYM_BRIGHTNESS;
-	default:         return NULL;
+	case MOD_CPU:      return SYM_CPU;
+	case MOD_RAM:      return SYM_RAM;
+	case MOD_TEMP:     return SYM_TEMP;
+	case MOD_HOME:     return SYM_HOME;
+	case MOD_UPTIME:   return SYM_UPTIME;
+	case MOD_BRIGHT:   return SYM_BRIGHTNESS;
+	default:           return NULL;
 	}
 }
 
-static const char *
-wifi_signal_symbol(int quality, int level)
-{
-	if (level < 0 && level > -120) {
-		if (level >= -50)
-			return SYM_WIFI_4;
-		if (level >= -60)
-			return SYM_WIFI_3;
-		if (level >= -70)
-			return SYM_WIFI_2;
-		return SYM_WIFI_1;
-	}
 
-	if (quality >= 76)
-		return SYM_WIFI_4;
-	if (quality >= 51)
-		return SYM_WIFI_3;
-	if (quality >= 26)
-		return SYM_WIFI_2;
-	if (quality > 0)
-		return SYM_WIFI_1;
-
-	return NULL;
-}
-
-static const char *
-get_wifi_symbol(void)
-{
-	const char *sym;
-	int quality, level;
-
-	if (!wlan_if[0])
-		return SYM_WIFI_OFF;
-
-	if (read_wifi(&quality, &level) == 0) {
-		wifi_failures = 0;
-		sym = wifi_signal_symbol(quality, level);
-		if (sym)
-			return sym;
-	}
-
-	/* Stats are missing or all zero.  sysfs can still tell us that the
-	 * interface exists and is associated, which is the normal case for
-	 * cfg80211 drivers without WEXT.  Show a connected icon rather than
-	 * the off symbol when the signal level is unknown. */
-	if (wifi_iface_up(wlan_if)) {
-		wifi_failures = 0;
-		return SYM_WIFI_4;
-	}
-
-	/* An interface that exists but is down should be sampled again soon,
-	 * not treated as a vanished device.  This also lets it recover when
-	 * it associates later. */
-	if (wifi_iface_exists(wlan_if)) {
-		wifi_failures = 0;
-		return SYM_WIFI_OFF;
-	}
-
-	if (++wifi_failures >= 10) {
-		/* Stop sampling an interface that is no longer there; the
-		 * scheduler will retry discovery at WIFI_RETRY_INTERVAL
-		 * instead of waking for a vanished device. */
-		wlan_if[0] = '\0';
-		wifi_failures = 0;
-		wifi_next = now_ms() + interval_ms(WIFI_RETRY_INTERVAL);
-	}
-
-	return SYM_WIFI_OFF;
-}
 
 /* -------------------------------------------------------------------------
  * external helpers
@@ -2110,37 +2040,41 @@ build_status(struct outbuf *o, long long now)
 			break;
 		case MOD_UPTIME:
 			if (module_due(&mstate[MOD_UPTIME].next, interval, now)) {
-				unsigned long long h = 0;
+				unsigned long long h = 0, m = 0;
 				mstate[MOD_UPTIME].valid =
-				    get_uptime_hours(&h) == 0;
-				if (mstate[MOD_UPTIME].valid)
+				    get_uptime_hours_minutes(&h, &m) == 0;
+				if (mstate[MOD_UPTIME].valid) {
 					mstate[MOD_UPTIME].val.ull = h;
+					mstate[MOD_UPTIME + 1].val.i = (int)m;
+				}
 			}
 			if (mstate[MOD_UPTIME].valid)
-				out_module(o, m->sep_before, "%s %lluh",
+				out_module(o, m->sep_before, "%s %lluh %dm",
 				    sym ? sym : SYM_UPTIME,
-				    mstate[MOD_UPTIME].val.ull);
+				    mstate[MOD_UPTIME].val.ull,
+				    mstate[MOD_UPTIME + 1].val.i);
 			break;
-		case MOD_WIFI:
-			if (wlan_if[0]) {
-				if (module_due(&wifi_sample_next, interval, now)) {
-					wifi_symbol = get_wifi_symbol();
-					wifi_valid = 1;
-				}
-			} else if (module_due(&wifi_next,
-			    WIFI_RETRY_INTERVAL, now)) {
-				find_wifi();
-				if (wlan_if[0]) {
-					wifi_sample_next = now +
-					    interval_ms(interval > 0 ? interval : 5);
-					wifi_symbol = get_wifi_symbol();
+		case MOD_NETWORK:
+			if (module_due(&mstate[MOD_NETWORK].next, interval, now)) {
+				FILE *fp = popen("ip route show default 2>/dev/null | grep -q default && echo 1 || echo 0", "r");
+				char buf[4] = {0};
+				if (fp) {
+					if (fgets(buf, sizeof buf, fp))
+						net_connected = buf[0] == '1';
+					pclose(fp);
 				} else {
-					wifi_symbol = SYM_WIFI_OFF;
+					net_connected = 0;
 				}
-				wifi_valid = 1;
+				net_valid = 1;
 			}
-			if (wifi_valid)
-				out_module(o, m->sep_before, "%s", wifi_symbol);
+			if (net_valid) {
+				if (net_connected)
+					out_module(o, m->sep_before, "%s Connected",
+					    SYM_NET_CONNECTED);
+				else
+					out_module(o, m->sep_before, "%s Disconnected",
+					    SYM_NET_DISCONNECTED);
+			}
 			break;
 		case MOD_TEMP:
 			if (!temp_missing) {
@@ -2332,13 +2266,9 @@ next_due_ms(void)
 			if (mstate[MOD_UPTIME].next < next)
 				next = mstate[MOD_UPTIME].next;
 			break;
-		case MOD_WIFI:
-			if (wlan_if[0]) {
-				if (wifi_sample_next < next)
-					next = wifi_sample_next;
-			} else if (wifi_next < next) {
-				next = wifi_next;
-			}
+		case MOD_NETWORK:
+			if (mstate[MOD_NETWORK].next < next)
+				next = mstate[MOD_NETWORK].next;
 			break;
 		case MOD_TEMP:
 			if (!temp_missing && mstate[MOD_TEMP].next < next)
@@ -2447,19 +2377,9 @@ init_state(void)
 				mod_available[m->id] = 1;
 			}
 			break;
-		case MOD_WIFI:
-			find_wifi();
-			if (wlan_if[0]) {
-				mod_enabled[m->id] = 1;
-				mod_available[m->id] = 1;
-			} else {
-				/* keep off-symbol retry behavior */
-				wifi_symbol = SYM_WIFI_OFF;
-				wifi_valid = 1;
-				wifi_next = now_ms() + interval_ms(WIFI_RETRY_INTERVAL);
-				mod_enabled[m->id] = 1;
-				mod_available[m->id] = 0;
-			}
+		case MOD_NETWORK:
+			mod_enabled[m->id] = 1;
+			mod_available[m->id] = 1;
 			break;
 		case MOD_BRIGHT:
 			find_backlight();
@@ -2528,13 +2448,7 @@ init_state(void)
 			find_temp();
 			temp_missing = !temp_path[0];
 			break;
-		case MOD_WIFI:
-			find_wifi();
-			if (!wlan_if[0]) {
-				wifi_symbol = SYM_WIFI_OFF;
-				wifi_valid = 1;
-				wifi_next = now_ms() + interval_ms(WIFI_RETRY_INTERVAL);
-			}
+		case MOD_NETWORK:
 			break;
 		case MOD_BRIGHT:
 			find_backlight();

@@ -37,7 +37,7 @@ enum {
 	MOD_RAM,
 	MOD_HOME,
 	MOD_UPTIME,
-	MOD_WIFI,
+	MOD_NETWORK,
 	MOD_TEMP,
 	MOD_VOL,
 	MOD_MIC,
@@ -56,13 +56,13 @@ struct module {
 };
 
 static const struct module MODULES[] = {
-	{ MOD_SONG,   NULL,     -1, 1, 0  },
-	{ MOD_CPU,    NULL,      1, 0, 2  },
-	{ MOD_RAM,    NULL,      1, 0, 2  },
-	{ MOD_HOME,   NULL,     -1, 1, 10 },
-	{ MOD_UPTIME, NULL,     -1, 1, 60 },
-	{ MOD_WIFI,   NULL,     -1, 1, 5  },
-	{ MOD_TEMP,   NULL,     -1, 1, 5  },
+	{ MOD_SONG,    NULL,     -1, 1, 0  },
+	{ MOD_CPU,     NULL,      1, 0, 2  },
+	{ MOD_RAM,     NULL,      1, 0, 2  },
+	{ MOD_HOME,    NULL,     -1, 1, 10 },
+	{ MOD_UPTIME,  NULL,     -1, 1, 60 },
+	{ MOD_NETWORK, NULL,     -1, 1, 5  },
+	{ MOD_TEMP,    NULL,     -1, 1, 5  },
 	{ MOD_VOL,    NULL,     -1, 1, 0  },
 	{ MOD_MIC,    NULL,      0, 0, 0  },
 	{ MOD_BAT,    NULL,     -1, 1, 10 },
@@ -88,9 +88,7 @@ static const int CPU_INTERVAL = 2;
 static const int RAM_INTERVAL = 2;
 static const int HOME_INTERVAL = 10;
 static const int UPTIME_INTERVAL = 60;
-static const int WIFI_INTERVAL = 5;
-/* When no wireless interface exists, rediscover it this often. */
-static const int WIFI_RETRY_INTERVAL = 30;
+static const int NETWORK_INTERVAL = 5;
 static const int TEMP_INTERVAL = 5;
 static const int BATTERY_INTERVAL = 10;
 static const int BRIGHTNESS_INTERVAL = 2;
@@ -138,11 +136,8 @@ static const char *const SYM_MIC_OFF = "";
 static const char *const SYM_MUSIC_PAUSE = "";
 static const char *const SYM_MUSIC_PLAY = "";
 
-static const char *const SYM_WIFI_4 = "󰤨";
-static const char *const SYM_WIFI_3 = "󰤥";
-static const char *const SYM_WIFI_2 = "󰤢";
-static const char *const SYM_WIFI_1 = "󰤟";
-static const char *const SYM_WIFI_OFF = "󰤭";
+static const char *const SYM_NET_CONNECTED = "󰱓";
+static const char *const SYM_NET_DISCONNECTED = "󰅛";
 
 static const char *const SYM_HOME = "";
 
