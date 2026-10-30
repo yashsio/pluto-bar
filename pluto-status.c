@@ -2,17 +2,8 @@
  *
  * pluto-status - the status feed for pluto-bar.
  *
- * This is a drop-in replacement for status.sh.  Each module has its own
- * compile-time refresh interval; the scheduler sleeps until the next module is
- * due, and writes a line only when the text changes, with the same fields,
- * order, glyphs and separators as the old script.  Modules with no hardware
- * are dropped from the schedule instead of being probed forever.
- *
- * /proc and /sys are read directly, so CPU, RAM, disk, uptime, temperature,
- * battery, wifi, brightness and the clock do not fork.  Audio is followed
- * through libpulse when it is available, and music through one persistent
- * `playerctl --follow`; both fall back to polling when unavailable.  The
- * remaining helpers (bluetoothctl, powerprofilesctl) are cached.
+ * Modules are configured in status-config.h via the MODULES[] array.
+ * Order, grouping, intervals and symbols are all controlled there.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -70,19 +61,19 @@ static int backlight_max = -1;
 /* optional helpers */
 static int have_playerctl;
 static int have_wpctl;
-static int have_powerprofilesctl;
 static int have_brightnessctl;
-static int have_bluetoothctl;
 static char playerctl_path[PATH_MAX];
 static char wpctl_path[PATH_MAX];
-static char powerprofilesctl_path[PATH_MAX];
 static char brightnessctl_path[PATH_MAX];
-static char bluetoothctl_path[PATH_MAX];
 
 /* cpu delta */
 static unsigned long long prev_cpu_total;
 static unsigned long long prev_cpu_idle;
 static int cpu_sampled;
+
+/* module enable/availability state (derived from MODULES[]) */
+static char mod_enabled[MOD_COUNT];
+static char mod_available[MOD_COUNT];
 
 /* per-module sampling state */
 static long long cpu_next;
@@ -112,21 +103,11 @@ static int temp_value;
 static int temp_valid;
 static int temp_missing;
 
-static int bt_on;
-static int bt_valid;
-static long long bt_next;
-
 static long long battery_next;
 static int battery_pct;
 static int battery_charging;
 static int battery_valid;
 static int battery_missing;
-
-static char pp_value[64];
-static const char *power_symbol;
-static int power_valid;
-static long long power_next;
-static int power_missing;
 
 static long long brightness_next;
 static int brightness_value;
@@ -177,7 +158,6 @@ static char music_poll_state[32];
 static char music_poll_song[512];
 static volatile sig_atomic_t player_pid;
 
-static const char *power_profile_symbol(const char *profile);
 static void utf8_truncate(char *s, size_t max);
 static void trim_ws(char *s);
 static void wake_main(void);
@@ -203,8 +183,7 @@ out_raw(struct outbuf *b, const char *s)
 
 /*
  * Append one module.  The module text is trimmed first, then joined to the
- * previous module with SEP or GAP.  This is the only place that inserts
- * spacing between modules, so the gap is identical for every pair.
+ * previous module with SEP or GAP.
  */
 static void
 out_module(struct outbuf *b, int separate, const char *fmt, ...)
@@ -224,8 +203,7 @@ out_module(struct outbuf *b, int separate, const char *fmt, ...)
 		return;
 
 	if (b->len)
-		out_raw(b, SHOW_SEPARATOR && (SEPARATE_ALL || separate) ? SEP
-		    : GAP);
+		out_raw(b, SHOW_SEPARATOR && separate ? SEP : GAP);
 	out_raw(b, tmp);
 }
 
@@ -398,6 +376,8 @@ interval_ms(int seconds)
 static int
 module_due(long long *next, int interval, long long now)
 {
+	if (interval <= 0)
+		return 0;
 	if (now < *next)
 		return 0;
 
@@ -1167,6 +1147,46 @@ read_wifi(int *quality, int *level)
 	return -1;
 }
 
+static int
+module_interval(int id)
+{
+	switch (id) {
+	case MOD_CPU:
+	case MOD_RAM:
+	case MOD_BRIGHT:
+		return 2;
+	case MOD_WIFI:
+	case MOD_TEMP:
+		return 5;
+	case MOD_HOME:
+	case MOD_BAT:
+		return 10;
+	case MOD_UPTIME:
+	case MOD_CLOCK:
+		return 60;
+	case MOD_VOL:
+	case MOD_MIC:
+	case MOD_SONG:
+		return 0;
+	default:
+		return 10;
+	}
+}
+
+static const char *
+module_symbol(int id)
+{
+	switch (id) {
+	case MOD_CPU:    return SYM_CPU;
+	case MOD_RAM:    return SYM_RAM;
+	case MOD_TEMP:   return SYM_TEMP;
+	case MOD_HOME:   return SYM_HOME;
+	case MOD_UPTIME: return SYM_UPTIME;
+	case MOD_BRIGHT: return SYM_BRIGHTNESS;
+	default:         return NULL;
+	}
+}
+
 static const char *
 wifi_signal_symbol(int quality, int level)
 {
@@ -1578,7 +1598,7 @@ start_pulse(void)
 	pthread_t thread;
 	int i;
 
-	if (!(ENABLE_VOL || ENABLE_MIC))
+	if (!mod_enabled[MOD_VOL] && !mod_enabled[MOD_MIC])
 		return;
 
 	pulse_started = 1;
@@ -1650,7 +1670,7 @@ sample_audio(long long now)
 {
 	int polling;
 
-	if (!(ENABLE_VOL || ENABLE_MIC))
+	if (!mod_enabled[MOD_VOL] && !mod_enabled[MOD_MIC])
 		return;
 	if (!audio_available()) {
 		sink_valid = 0;
@@ -1669,11 +1689,11 @@ sample_audio(long long now)
 		audio_next = now + interval_ms(AUDIO_INTERVAL);
 	}
 
-	if (ENABLE_VOL) {
+	if (mod_enabled[MOD_VOL]) {
 		sink_value = get_audio_cached(0, &sink_muted);
 		sink_valid = sink_value >= 0;
 	}
-	if (ENABLE_MIC) {
+	if (mod_enabled[MOD_MIC]) {
 		source_value = get_audio_cached(1, &source_muted);
 		source_valid = source_value >= 0;
 	}
@@ -1905,7 +1925,7 @@ start_player_follow(void)
 {
 	pthread_t thread;
 
-	if (!ENABLE_SONG || !have_playerctl)
+	if (!mod_enabled[MOD_SONG] || !have_playerctl)
 		return;
 
 	{
@@ -1922,53 +1942,7 @@ start_player_follow(void)
 	music_follow = 1;
 }
 
-static int
-get_bt(int *on)
-{
-	char out[4096];
-	char *argv[] = { bluetoothctl_path, "show", NULL };
 
-	*on = 0;
-	if (!have_bluetoothctl)
-		return 0;
-
-	if (run_cmd(argv, out, sizeof out, COMMAND_TIMEOUT_MS) == 0)
-		*on = strstr(out, "Powered: yes") != NULL;
-
-	return 0;
-}
-
-static const char *
-get_power_profile(void)
-{
-	char buf[64];
-	const char *sym;
-
-	if (read_file("/sys/firmware/acpi/platform_profile", buf, sizeof buf) >= 0) {
-		trim_ws(buf);
-		if (buf[0]) {
-			sym = power_profile_symbol(buf);
-			if (sym)
-				return sym;
-		}
-	}
-
-	if (!have_powerprofilesctl)
-		return NULL;
-
-	{
-		char out[64];
-		char *argv[] = { powerprofilesctl_path, "get", NULL };
-
-		pp_value[0] = '\0';
-		if (run_cmd(argv, out, sizeof out, COMMAND_TIMEOUT_MS) == 0) {
-			trim_ws(out);
-			copy_str(pp_value, sizeof pp_value, out);
-		}
-	}
-
-	return pp_value[0] ? power_profile_symbol(pp_value) : NULL;
-}
 
 /* -------------------------------------------------------------------------
  * formatting helpers
@@ -2009,19 +1983,7 @@ music_symbol(const char *state)
 	return NULL;
 }
 
-static const char *
-power_profile_symbol(const char *profile)
-{
-	if (strcmp(profile, "performance") == 0)
-		return SYM_POWER_PERFORMANCE;
-	if (strcmp(profile, "balanced") == 0)
-		return SYM_POWER_BALANCED;
-	if (strcmp(profile, "power-saver") == 0 ||
-	    strcmp(profile, "low-power") == 0)
-		return SYM_POWER_POWERSAVE;
 
-	return NULL;
-}
 
 static size_t
 utf8_len(unsigned char c)
@@ -2112,233 +2074,274 @@ next_clock_ms(long long now)
 static void
 build_status(struct outbuf *o, long long now)
 {
+	size_t i;
 	const char *sym;
 
 	o->len = 0;
 	o->s[0] = '\0';
 
-	if (ENABLE_CPU) {
-		if (module_due(&cpu_next, CPU_INTERVAL, now)) {
-			cpu_value = get_cpu();
-			cpu_valid = cpu_value >= 0;
-		}
-		if (cpu_valid)
-			out_module(o, SEPARATE_CPU, "%s %d%%", SYM_CPU,
-			    cpu_value);
-	}
+	for (i = 0; i < (sizeof MODULES / sizeof MODULES[0]); i++) {
+		const struct module *m = &MODULES[i];
+		int interval;
 
-	if (ENABLE_RAM) {
-		if (module_due(&ram_next, RAM_INTERVAL, now)) {
-			ram_value = get_ram();
-			ram_valid = ram_value >= 0;
-		}
-		if (ram_valid)
-			out_module(o, SEPARATE_RAM, "%s %d%%", SYM_RAM,
-			    ram_value);
-	}
+		if (m->id < 0 || m->id >= MOD_COUNT)
+			continue;
+		if (!mod_enabled[m->id])
+			continue;
 
-	if (TOGGLE_HOME) {
-		if (module_due(&home_next, HOME_INTERVAL, now))
-			home_valid = get_home_gb(&home_value) == 0;
-		if (home_valid)
-			out_module(o, SEPARATE_HOME, "%s %lluG", SYM_HOME,
-			    home_value);
-	}
+		interval = m->interval > 0 ? m->interval : module_interval(m->id);
+		sym = m->symbol ? m->symbol : module_symbol(m->id);
 
-	if (TOGGLE_UPTIME) {
-		if (module_due(&uptime_next, UPTIME_INTERVAL, now))
-			uptime_valid = get_uptime_hours(&uptime_value) == 0;
-		if (uptime_valid)
-			out_module(o, SEPARATE_UPTIME, "%s %lluh", SYM_UPTIME,
-			    uptime_value);
-	}
-
-	if (ENABLE_WIFI) {
-		if (wlan_if[0]) {
-			if (module_due(&wifi_sample_next, WIFI_INTERVAL, now)) {
-				wifi_symbol = get_wifi_symbol();
+		switch (m->id) {
+		case MOD_CPU:
+			if (module_due(&cpu_next, interval, now)) {
+				cpu_value = get_cpu();
+				cpu_valid = cpu_value >= 0;
+			}
+			if (cpu_valid)
+				out_module(o, m->sep_before, "%s %d%%",
+				    sym ? sym : SYM_CPU, cpu_value);
+			break;
+		case MOD_RAM:
+			if (module_due(&ram_next, interval, now)) {
+				ram_value = get_ram();
+				ram_valid = ram_value >= 0;
+			}
+			if (ram_valid)
+				out_module(o, m->sep_before, "%s %d%%",
+				    sym ? sym : SYM_RAM, ram_value);
+			break;
+		case MOD_HOME:
+			if (module_due(&home_next, interval, now))
+				home_valid = get_home_gb(&home_value) == 0;
+			if (home_valid)
+				out_module(o, m->sep_before, "%s %lluG",
+				    sym ? sym : SYM_HOME, home_value);
+			break;
+		case MOD_UPTIME:
+			if (module_due(&uptime_next, interval, now))
+				uptime_valid = get_uptime_hours(&uptime_value) == 0;
+			if (uptime_valid)
+				out_module(o, m->sep_before, "%s %lluh",
+				    sym ? sym : SYM_UPTIME, uptime_value);
+			break;
+		case MOD_WIFI:
+			if (wlan_if[0]) {
+				if (module_due(&wifi_sample_next, interval, now)) {
+					wifi_symbol = get_wifi_symbol();
+					wifi_valid = 1;
+				}
+			} else if (module_due(&wifi_next,
+			    WIFI_RETRY_INTERVAL, now)) {
+				find_wifi();
+				if (wlan_if[0]) {
+					wifi_sample_next = now +
+					    interval_ms(interval > 0 ? interval : 5);
+					wifi_symbol = get_wifi_symbol();
+				} else {
+					wifi_symbol = SYM_WIFI_OFF;
+				}
 				wifi_valid = 1;
 			}
-		} else if (module_due(&wifi_next, WIFI_RETRY_INTERVAL, now)) {
-			find_wifi();
-			if (wlan_if[0]) {
-				wifi_sample_next = now + interval_ms(WIFI_INTERVAL);
-				wifi_symbol = get_wifi_symbol();
-			} else {
-				wifi_symbol = SYM_WIFI_OFF;
+			if (wifi_valid)
+				out_module(o, m->sep_before, "%s", wifi_symbol);
+			break;
+		case MOD_TEMP:
+			if (!temp_missing) {
+				if (module_due(&temp_next, interval, now)) {
+					if (get_temp(&temp_value) == 0)
+						temp_valid = 1;
+					else {
+						temp_value = -1;
+						temp_valid = 0;
+					}
+				}
+				if (temp_valid)
+					out_module(o, m->sep_before, "%s %d°C",
+					    sym ? sym : SYM_TEMP, temp_value);
 			}
-			wifi_valid = 1;
-		}
-		if (wifi_valid)
-			out_module(o, SEPARATE_WIFI, "%s", wifi_symbol);
-	}
-
-	if (ENABLE_BT) {
-		if (have_bluetoothctl &&
-		    module_due(&bt_next, BLUETOOTH_INTERVAL, now)) {
-			get_bt(&bt_on);
-			bt_valid = 1;
-		}
-		if (bt_valid) {
-			if (bt_on)
-				out_module(o, SEPARATE_BT, "%s", SYM_BT);
-			else
-				out_module(o, SEPARATE_BT, "%s Off",
-				    SYM_BT_OFF);
-		}
-	}
-
-	if (ENABLE_TEMP && !temp_missing) {
-		if (module_due(&temp_next, TEMP_INTERVAL, now)) {
-			if (get_temp(&temp_value) == 0) {
-				temp_valid = 1;
-			} else {
-				temp_value = -1;
-				temp_valid = 0;
+			break;
+		case MOD_VOL:
+			if (mod_enabled[MOD_VOL] || mod_enabled[MOD_MIC])
+				sample_audio(now);
+			if (sink_valid) {
+				sym = volume_symbol(sink_muted, sink_value);
+				if (sink_muted || sink_value == 0)
+					out_module(o, m->sep_before, "%s Mute",
+					    sym);
+				else
+					out_module(o, m->sep_before, "%s %d%%",
+					    sym, sink_value);
 			}
-		}
-		if (temp_valid)
-			out_module(o, SEPARATE_TEMP, "%s %d°C", SYM_TEMP,
-			    temp_value);
-	}
-
-	if (ENABLE_VOL || ENABLE_MIC)
-		sample_audio(now);
-
-	if (ENABLE_VOL && sink_valid) {
-		sym = volume_symbol(sink_muted, sink_value);
-		if (sink_muted || sink_value == 0)
-			out_module(o, SEPARATE_VOLUME, "%s Mute", sym);
-		else
-			out_module(o, SEPARATE_VOLUME, "%s %d%%", sym,
-			    sink_value);
-	}
-
-	if (ENABLE_MIC && source_valid) {
-		if (source_muted)
-			out_module(o, SEPARATE_MIC, "%s Mute", SYM_MIC_OFF);
-		else
-			out_module(o, SEPARATE_MIC, "%s %d%%", SYM_MIC_ON,
-			    source_value);
-	}
-
-	if (ENABLE_BAT && !battery_missing) {
-		if (module_due(&battery_next, BATTERY_INTERVAL, now))
-			battery_valid = get_battery(&battery_pct,
-			    &battery_charging) == 0;
-		if (battery_valid) {
-			if (battery_charging)
-				out_module(o, SEPARATE_BATTERY, "%s %d%%",
-				    SYM_CHARGING, battery_pct);
-			else
-				out_module(o, SEPARATE_BATTERY, "%s %d%%",
-				    battery_symbol(battery_pct), battery_pct);
-		}
-	}
-
-	if (ENABLE_POWER_PROFILE && !power_missing) {
-		if (module_due(&power_next, POWER_PROFILE_INTERVAL, now)) {
-			power_symbol = get_power_profile();
-			power_valid = power_symbol != NULL;
-		}
-		if (power_valid)
-			out_module(o, SEPARATE_POWER_PROFILE, "%s",
-			    power_symbol);
-	}
-
-	if (TOGGLE_BRIGHTNESS && !brightness_missing) {
-		if (module_due(&brightness_next, BRIGHTNESS_INTERVAL, now)) {
-			brightness_value = get_brightness();
-			brightness_valid = brightness_value >= 0;
-		}
-		if (brightness_valid)
-			out_module(o, SEPARATE_BRIGHTNESS, "%s %d%%",
-			    SYM_BRIGHTNESS, brightness_value);
-	}
-
-	if (ENABLE_SONG && have_playerctl) {
-		char state[32];
-		char song[512];
-
-		if (!music_follow) {
-			if (now >= music_poll_next) {
-				get_music_cached(music_poll_state,
-				    sizeof music_poll_state, music_poll_song,
-				    sizeof music_poll_song);
-				music_poll_next = now + MUSIC_CHECK_MS;
+			break;
+		case MOD_MIC:
+			if (mod_enabled[MOD_VOL] || mod_enabled[MOD_MIC])
+				sample_audio(now);
+			if (source_valid) {
+				if (source_muted)
+					out_module(o, m->sep_before, "%s Mute",
+					    SYM_MIC_OFF);
+				else
+					out_module(o, m->sep_before, "%s %d%%",
+					    SYM_MIC_ON, source_value);
 			}
-			copy_str(state, sizeof state, music_poll_state);
-			copy_str(song, sizeof song, music_poll_song);
-		} else {
-			get_music_cached(state, sizeof state, song, sizeof song);
-		}
+			break;
+		case MOD_BAT:
+			if (!battery_missing) {
+				if (module_due(&battery_next, interval, now))
+					battery_valid = get_battery(&battery_pct,
+					    &battery_charging) == 0;
+				if (battery_valid) {
+					if (battery_charging)
+						out_module(o, m->sep_before,
+						    "%s %d%%", SYM_CHARGING,
+						    battery_pct);
+					else
+						out_module(o, m->sep_before,
+						    "%s %d%%",
+						    battery_symbol(battery_pct),
+						    battery_pct);
+				}
+			}
+			break;
+		case MOD_BRIGHT:
+			if (!brightness_missing) {
+				if (module_due(&brightness_next, interval, now)) {
+					brightness_value = get_brightness();
+					brightness_valid = brightness_value >= 0;
+				}
+				if (brightness_valid)
+					out_module(o, m->sep_before, "%s %d%%",
+					    sym ? sym : SYM_BRIGHTNESS,
+					    brightness_value);
+			}
+			break;
+		case MOD_SONG:
+			if (have_playerctl) {
+				char state[32];
+				char song[512];
 
-		sym = music_symbol(state);
-		if (sym) {
-			if (song[0])
-				out_module(o, SEPARATE_MUSIC, "%s %s", sym,
-				    song);
-			else
-				out_module(o, SEPARATE_MUSIC, "%s", sym);
-		}
-	}
+				if (!music_follow) {
+					if (now >= music_poll_next) {
+						get_music_cached(music_poll_state,
+						    sizeof music_poll_state,
+						    music_poll_song,
+						    sizeof music_poll_song);
+						music_poll_next = now +
+						    MUSIC_CHECK_MS;
+					}
+					copy_str(state, sizeof state,
+					    music_poll_state);
+					copy_str(song, sizeof song,
+					    music_poll_song);
+				} else {
+					get_music_cached(state, sizeof state,
+					    song, sizeof song);
+				}
 
-	if (ENABLE_CLOCK) {
-		if (module_due(&clock_next, CLOCK_INTERVAL, now)) {
-			get_clock(clock_value, sizeof clock_value);
-			clock_valid = clock_value[0] != '\0';
-			clock_next = next_clock_ms(now);
+				sym = music_symbol(state);
+				if (sym) {
+					if (song[0])
+						out_module(o, m->sep_before,
+						    "%s %s", sym, song);
+					else
+						out_module(o, m->sep_before, "%s",
+						    sym);
+				}
+			}
+			break;
+		case MOD_CLOCK:
+			if (module_due(&clock_next, interval, now)) {
+				get_clock(clock_value, sizeof clock_value);
+				clock_valid = clock_value[0] != '\0';
+				clock_next = next_clock_ms(now);
+			}
+			if (clock_valid)
+				out_module(o, m->sep_before, "%s", clock_value);
+			break;
+		default:
+			break;
 		}
-		if (clock_valid)
-			out_module(o, SEPARATE_CLOCK, "%s", clock_value);
 	}
 }
 
 static long long
 next_due_ms(void)
 {
+	size_t i;
 	long long next = LLONG_MAX;
 
-	if (ENABLE_CPU && cpu_next < next)
-		next = cpu_next;
-	if (ENABLE_RAM && ram_next < next)
-		next = ram_next;
-	if (TOGGLE_HOME && home_next < next)
-		next = home_next;
-	if (TOGGLE_UPTIME && uptime_next < next)
-		next = uptime_next;
-	if (ENABLE_WIFI) {
-		if (wlan_if[0]) {
-			if (wifi_sample_next < next)
-				next = wifi_sample_next;
-		} else if (wifi_next < next) {
-			next = wifi_next;
-		}
-	}
-	if (ENABLE_BT && have_bluetoothctl && bt_next < next)
-		next = bt_next;
-	if (ENABLE_TEMP && !temp_missing && temp_next < next)
-		next = temp_next;
-	if (ENABLE_BAT && !battery_missing && battery_next < next)
-		next = battery_next;
-	if (ENABLE_POWER_PROFILE && !power_missing && power_next < next)
-		next = power_next;
-	if (TOGGLE_BRIGHTNESS && !brightness_missing &&
-	    brightness_next < next)
-		next = brightness_next;
-	if ((ENABLE_VOL || ENABLE_MIC) && audio_polling() &&
-	    audio_next < next)
-		next = audio_next;
-	if (ENABLE_CLOCK && clock_next < next)
-		next = clock_next;
+	for (i = 0; i < (sizeof MODULES / sizeof MODULES[0]); i++) {
+		const struct module *m = &MODULES[i];
+		int interval;
 
-	if (ENABLE_SONG && have_playerctl) {
-		if (music_follow) {
-			if (music_cached() && music_next_check < next)
-				next = music_next_check;
-		} else if (music_poll_next < next) {
-			next = music_poll_next;
+		if (m->id < 0 || m->id >= MOD_COUNT)
+			continue;
+		if (!mod_enabled[m->id])
+			continue;
+
+		interval = m->interval > 0 ? m->interval : module_interval(m->id);
+
+		switch (m->id) {
+		case MOD_CPU:
+			if (cpu_next < next)
+				next = cpu_next;
+			break;
+		case MOD_RAM:
+			if (ram_next < next)
+				next = ram_next;
+			break;
+		case MOD_HOME:
+			if (home_next < next)
+				next = home_next;
+			break;
+		case MOD_UPTIME:
+			if (uptime_next < next)
+				next = uptime_next;
+			break;
+		case MOD_WIFI:
+			if (wlan_if[0]) {
+				if (wifi_sample_next < next)
+					next = wifi_sample_next;
+			} else if (wifi_next < next) {
+				next = wifi_next;
+			}
+			break;
+		case MOD_TEMP:
+			if (!temp_missing && temp_next < next)
+				next = temp_next;
+			break;
+		case MOD_VOL:
+		case MOD_MIC:
+			if (audio_polling() && audio_next < next)
+				next = audio_next;
+			break;
+		case MOD_BAT:
+			if (!battery_missing && battery_next < next)
+				next = battery_next;
+			break;
+		case MOD_BRIGHT:
+			if (!brightness_missing && brightness_next < next)
+				next = brightness_next;
+			break;
+		case MOD_SONG:
+			if (have_playerctl) {
+				if (music_follow) {
+					if (music_cached() && music_next_check < next)
+						next = music_next_check;
+				} else if (music_poll_next < next) {
+					next = music_poll_next;
+				}
+			}
+			break;
+		case MOD_CLOCK:
+			if (clock_next < next)
+				next = clock_next;
+			break;
+		default:
+			break;
 		}
+		(void)interval;
 	}
 
 	if (next == LLONG_MAX)
@@ -2354,77 +2357,182 @@ next_due_ms(void)
 static void
 init_state(void)
 {
+	size_t i;
+
+	memset(mod_enabled, 0, sizeof mod_enabled);
+	memset(mod_available, 0, sizeof mod_available);
+
 	have_playerctl = find_cmd_path("playerctl", playerctl_path,
 	    sizeof playerctl_path) == 0;
 	have_wpctl = find_cmd_path("wpctl", wpctl_path,
 	    sizeof wpctl_path) == 0;
-	have_powerprofilesctl = find_cmd_path("powerprofilesctl",
-	    powerprofilesctl_path, sizeof powerprofilesctl_path) == 0;
 	have_brightnessctl = find_cmd_path("brightnessctl",
 	    brightnessctl_path, sizeof brightnessctl_path) == 0;
-	have_bluetoothctl = find_cmd_path("bluetoothctl",
-	    bluetoothctl_path, sizeof bluetoothctl_path) == 0;
 
-	if (ENABLE_BAT) {
-		find_battery();
-		battery_missing = !battery_dir[0];
+	for (i = 0; i < (sizeof MODULES / sizeof MODULES[0]); i++) {
+		const struct module *m = &MODULES[i];
+
+		if (m->id < 0 || m->id >= MOD_COUNT)
+			continue;
+		if (m->enabled == 0) {
+			mod_enabled[m->id] = 0;
+			continue;
+		}
+		if (m->enabled == 1) {
+			mod_enabled[m->id] = 1;
+			mod_available[m->id] = 1;
+			continue;
+		}
+		/* auto-detect */
+		mod_enabled[m->id] = 0;
+		mod_available[m->id] = 0;
 	}
-	if (ENABLE_TEMP) {
-		find_temp();
-		temp_missing = !temp_path[0];
-	}
-	if (ENABLE_WIFI) {
-		find_wifi();
-		if (!wlan_if[0]) {
-			/* Keep the same "off" field as before, but only retry
-			 * discovery occasionally instead of sampling every
-			 * WIFI_INTERVAL. */
-			wifi_symbol = SYM_WIFI_OFF;
-			wifi_valid = 1;
-			wifi_next = now_ms() + interval_ms(WIFI_RETRY_INTERVAL);
+
+
+
+	/* run detection for auto modules */
+	for (i = 0; i < (sizeof MODULES / sizeof MODULES[0]); i++) {
+		const struct module *m = &MODULES[i];
+		if (m->id < 0 || m->id >= MOD_COUNT)
+			continue;
+		if (m->enabled != -1)
+			continue;
+
+		switch (m->id) {
+		case MOD_BAT:
+			find_battery();
+			battery_missing = !battery_dir[0];
+			if (battery_dir[0]) {
+				mod_enabled[m->id] = 1;
+				mod_available[m->id] = 1;
+			}
+			break;
+		case MOD_TEMP:
+			find_temp();
+			temp_missing = !temp_path[0];
+			if (temp_path[0]) {
+				mod_enabled[m->id] = 1;
+				mod_available[m->id] = 1;
+			}
+			break;
+		case MOD_WIFI:
+			find_wifi();
+			if (wlan_if[0]) {
+				mod_enabled[m->id] = 1;
+				mod_available[m->id] = 1;
+			} else {
+				/* keep off-symbol retry behavior */
+				wifi_symbol = SYM_WIFI_OFF;
+				wifi_valid = 1;
+				wifi_next = now_ms() + interval_ms(WIFI_RETRY_INTERVAL);
+				mod_enabled[m->id] = 1;
+				mod_available[m->id] = 0;
+			}
+			break;
+		case MOD_BRIGHT:
+			find_backlight();
+			if (!backlight_path[0] && have_brightnessctl) {
+				char out[64];
+				char *argv[] = { brightnessctl_path, "max", NULL };
+
+				if (run_cmd(argv, out, sizeof out,
+				    COMMAND_TIMEOUT_MS) == 0)
+					backlight_max = parse_int(out);
+				if (backlight_max <= 0)
+					backlight_max = -1;
+			}
+			brightness_missing = !backlight_path[0] &&
+			    (!have_brightnessctl || backlight_max <= 0);
+			if (!brightness_missing) {
+				mod_enabled[m->id] = 1;
+				mod_available[m->id] = 1;
+			}
+			break;
+		case MOD_HOME:
+			mod_enabled[m->id] = 1;
+			mod_available[m->id] = 1;
+			break;
+		case MOD_UPTIME:
+			mod_enabled[m->id] = 1;
+			mod_available[m->id] = 1;
+			break;
+		case MOD_VOL:
+		case MOD_MIC:
+			if (have_wpctl) {
+				mod_enabled[m->id] = 1;
+				mod_available[m->id] = 1;
+			} else {
+#ifndef HAVE_PULSE
+				fprintf(stderr,
+				    "pluto-status: wpctl not found; "
+				    "volume/mic limited\n");
+#endif
+			}
+			break;
+		case MOD_SONG:
+			if (have_playerctl) {
+				mod_enabled[m->id] = 1;
+				mod_available[m->id] = 1;
+			}
+			break;
+		default:
+			break;
 		}
 	}
 
-	if (TOGGLE_BRIGHTNESS) {
-		find_backlight();
-		if (!backlight_path[0] && have_brightnessctl) {
-			char out[64];
-			char *argv[] = { brightnessctl_path, "max", NULL };
+	/* Also enable explicitly-enabled modules that need detection state */
+	for (i = 0; i < (sizeof MODULES / sizeof MODULES[0]); i++) {
+		const struct module *m = &MODULES[i];
+		if (m->id < 0 || m->id >= MOD_COUNT)
+			continue;
+		if (m->enabled != 1)
+			continue;
+		switch (m->id) {
+		case MOD_BAT:
+			find_battery();
+			battery_missing = !battery_dir[0];
+			break;
+		case MOD_TEMP:
+			find_temp();
+			temp_missing = !temp_path[0];
+			break;
+		case MOD_WIFI:
+			find_wifi();
+			if (!wlan_if[0]) {
+				wifi_symbol = SYM_WIFI_OFF;
+				wifi_valid = 1;
+				wifi_next = now_ms() + interval_ms(WIFI_RETRY_INTERVAL);
+			}
+			break;
+		case MOD_BRIGHT:
+			find_backlight();
+			if (!backlight_path[0] && have_brightnessctl) {
+				char out[64];
+				char *argv[] = { brightnessctl_path, "max", NULL };
 
-			if (run_cmd(argv, out, sizeof out, COMMAND_TIMEOUT_MS) == 0)
-				backlight_max = parse_int(out);
-			if (backlight_max <= 0)
-				backlight_max = -1;
+				if (run_cmd(argv, out, sizeof out,
+				    COMMAND_TIMEOUT_MS) == 0)
+					backlight_max = parse_int(out);
+				if (backlight_max <= 0)
+					backlight_max = -1;
+			}
+			brightness_missing = !backlight_path[0] &&
+			    (!have_brightnessctl || backlight_max <= 0);
+			break;
+		default:
+			break;
 		}
-		brightness_missing = !backlight_path[0] &&
-		    (!have_brightnessctl || backlight_max <= 0);
-	}
-
-	if (ENABLE_POWER_PROFILE)
-		power_missing = !have_powerprofilesctl &&
-		    access("/sys/firmware/acpi/platform_profile", R_OK) != 0;
-
-	if (ENABLE_BT && !have_bluetoothctl) {
-		bt_on = 0;
-		bt_valid = 1;
 	}
 
 #ifndef HAVE_PULSE
-	if ((ENABLE_VOL || ENABLE_MIC) && !have_wpctl)
+	if ((mod_enabled[MOD_VOL] || mod_enabled[MOD_MIC]) && !have_wpctl)
 		fprintf(stderr, "pluto-status: wpctl not found; "
 		    "volume and microphone are disabled\n");
 #endif
-	if (ENABLE_SONG && !have_playerctl)
+	if (mod_enabled[MOD_SONG] && !have_playerctl)
 		fprintf(stderr, "pluto-status: playerctl not found; "
 		    "song is disabled\n");
-	if (ENABLE_BT && !have_bluetoothctl)
-		fprintf(stderr, "pluto-status: bluetoothctl not found; "
-		    "bluetooth will show as off\n");
-	if (ENABLE_POWER_PROFILE && !have_powerprofilesctl &&
-	    access("/sys/firmware/acpi/platform_profile", R_OK) != 0)
-		fprintf(stderr, "pluto-status: powerprofilesctl not found; "
-		    "power profile is disabled\n");
-	if (TOGGLE_BRIGHTNESS && !backlight_path[0] && !have_brightnessctl)
+	if (mod_enabled[MOD_BRIGHT] && !backlight_path[0] && !have_brightnessctl)
 		fprintf(stderr, "pluto-status: no backlight device; "
 		    "brightness is disabled\n");
 }
@@ -2479,7 +2587,8 @@ main(int argc, char *argv[])
 		return 0;
 	}
 
-	start_player_follow();
+	if (mod_enabled[MOD_SONG])
+		start_player_follow();
 
 	for (;;) {
 		static char previous[OUTSIZE];
