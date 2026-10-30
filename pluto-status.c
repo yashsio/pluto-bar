@@ -54,7 +54,6 @@ struct outbuf {
 /* discovered hardware */
 static char battery_dir[PATH_MAX];
 static char temp_path[PATH_MAX];
-static char wlan_if[64];
 static char backlight_path[PATH_MAX];
 static int backlight_max = -1;
 
@@ -717,126 +716,6 @@ find_temp(void)
  * entry to /proc/net/wireless.  sysfs still has the net device, so use both
  * sources and prefer an associated link when more than one is present.
  */
-static int
-wifi_iface_exists(const char *name)
-{
-	char dir[PATH_MAX];
-
-	if (path_join(dir, sizeof dir, "/sys/class/net", name) < 0)
-		return 0;
-
-	return access(dir, F_OK) == 0;
-}
-
-static int
-wifi_iface_up(const char *name)
-{
-	char dir[PATH_MAX];
-	char path[PATH_MAX];
-	char buf[64];
-	int carrier;
-
-	if (path_join(dir, sizeof dir, "/sys/class/net", name) < 0)
-		return 0;
-
-	carrier = -1;
-	if (path_join(path, sizeof path, dir, "carrier") == 0)
-		carrier = read_int_file(path);
-	if (carrier >= 0)
-		return carrier == 1;
-
-	if (path_join(path, sizeof path, dir, "operstate") == 0 &&
-	    read_file(path, buf, sizeof buf) >= 0) {
-		trim_ws(buf);
-		if (strcmp(buf, "up") == 0)
-			return 1;
-		if (strcmp(buf, "down") == 0 || strcmp(buf, "dormant") == 0 ||
-		    strcmp(buf, "lowerlayerdown") == 0)
-			return 0;
-	}
-
-	/* WEXT sysfs has an explicit association state on some drivers. */
-	if (path_join(path, sizeof path, dir, "wireless/status") == 0 &&
-	    read_file(path, buf, sizeof buf) >= 0) {
-		trim_ws(buf);
-		return strcmp(buf, "Connected") == 0;
-	}
-
-	return 0;
-}
-
-static int
-wifi_iface_is_wireless(const char *dir)
-{
-	char path[PATH_MAX];
-
-	if (path_join(path, sizeof path, dir, "wireless") == 0 &&
-	    access(path, F_OK) == 0)
-		return 1;
-	if (path_join(path, sizeof path, dir, "phy80211") == 0 &&
-	    access(path, F_OK) == 0)
-		return 1;
-
-	return 0;
-}
-
-static void
-find_wifi(void)
-{
-	char buf[16384];
-	char first[64] = "";
-	char up[64] = "";
-	char *save = NULL;
-	char *line;
-	glob_t g;
-	size_t i;
-
-	wlan_if[0] = '\0';
-
-	/* /proc/net/wireless also carries the signal levels read below. */
-	if (read_file("/proc/net/wireless", buf, sizeof buf) >= 0) {
-		for (line = strtok_r(buf, "\n", &save); line;
-		     line = strtok_r(NULL, "\n", &save)) {
-			char *colon = strchr(line, ':');
-
-			/* The header has no colon.  Do not trust sscanf's
-			 * return value here: a scanset can succeed before the
-			 * literal ':' fails, which made the header look like
-			 * an interface. */
-			if (!colon)
-				continue;
-			*colon = '\0';
-			trim_ws(line);
-			if (!line[0] || strpbrk(line, " \t|"))
-				continue;
-
-			if (!first[0])
-				copy_str(first, sizeof first, line);
-			if (!up[0] && wifi_iface_up(line))
-				copy_str(up, sizeof up, line);
-		}
-	}
-
-	if (glob("/sys/class/net/*", 0, NULL, &g) == 0) {
-		for (i = 0; i < g.gl_pathc; i++) {
-			const char *name = strrchr(g.gl_pathv[i], '/');
-
-			if (!name || !name[1])
-				continue;
-			name++;
-			if (!wifi_iface_is_wireless(g.gl_pathv[i]))
-				continue;
-
-			if (!first[0])
-				copy_str(first, sizeof first, name);
-			if (!up[0] && wifi_iface_up(name))
-				copy_str(up, sizeof up, name);
-		}
-		globfree(&g);
-	}
-
-	copy_str(wlan_if, sizeof wlan_if, up[0] ? up : first);
-}
 
 static void
 find_backlight(void)
@@ -1063,68 +942,6 @@ get_brightness(void)
 		pct = 100;
 
 	return (int)pct;
-}
-
-static int
-read_wifi(int *quality, int *level)
-{
-	char buf[16384];
-	char *save = NULL;
-	char *line;
-
-	if (!wlan_if[0])
-		return -1;
-	if (read_file("/proc/net/wireless", buf, sizeof buf) < 0)
-		return -1;
-
-	for (line = strtok_r(buf, "\n", &save); line;
-	     line = strtok_r(NULL, "\n", &save)) {
-		char *colon, *p, *end;
-		char *fields[3];
-		int nf = 0;
-		long q, l;
-
-		colon = strchr(line, ':');
-		if (!colon)
-			continue;
-		p = colon + 1;
-		*colon = '\0';
-		trim_ws(line);
-		if (strcmp(line, wlan_if) != 0)
-			continue;
-
-		/* Split the remaining fields.  Quality and level are printed
-		 * with a trailing dot, e.g. "70.  -40."; strtol() stops at
-		 * the dot, and each field is already isolated here. */
-		while (nf < 3 && *p) {
-			while (*p == ' ' || *p == '\t')
-				p++;
-			if (!*p)
-				break;
-			fields[nf++] = p;
-			while (*p && *p != ' ' && *p != '\t')
-				p++;
-			if (*p)
-				*p++ = '\0';
-		}
-		if (nf < 3)
-			continue;
-
-		q = strtol(fields[1], &end, 10);
-		if (end == fields[1])
-			continue;
-		l = strtol(fields[2], &end, 10);
-		if (end == fields[2])
-			continue;
-		if (q < INT_MIN || q > INT_MAX || l < INT_MIN || l > INT_MAX)
-			continue;
-
-		*quality = (int)q;
-		*level = (int)l;
-		return 0;
-	}
-
-	return -1;
 }
 
 static int

@@ -18,8 +18,8 @@ static const int MAX_SONG = 40;
  * Give both the same padding if you want perfectly even spacing.
  * ------------------------------------------------------------------------- */
 static const int SHOW_SEPARATOR = 1;
-static const char *const SEP = "  |  ";
-static const char *const GAP = "  ";
+static const char *const SEP = " | ";
+static const char *const GAP = " ";
 
 /* ----------------------------------------------------------------------------
  * module layout
