@@ -77,6 +77,8 @@ static char mod_available[MOD_COUNT];
 struct module_state {
 	long long next;
 	int valid;
+	int charging; /* for battery */
+	int mins; /* for uptime minutes */
 	union {
 		int i;
 		unsigned long long ull;
@@ -1862,26 +1864,48 @@ build_status(struct outbuf *o, long long now)
 				    get_uptime_hours_minutes(&h, &m) == 0;
 				if (mstate[MOD_UPTIME].valid) {
 					mstate[MOD_UPTIME].val.ull = h;
-					mstate[MOD_UPTIME + 1].val.i = (int)m;
+					mstate[MOD_UPTIME].mins = (int)m;
 				}
 			}
 			if (mstate[MOD_UPTIME].valid)
 				out_module(o, m->sep_before, "%s %lluh %dm",
 				    sym ? sym : SYM_UPTIME,
 				    mstate[MOD_UPTIME].val.ull,
-				    mstate[MOD_UPTIME + 1].val.i);
+				    mstate[MOD_UPTIME].mins);
 			break;
 		case MOD_NETWORK:
 			if (module_due(&mstate[MOD_NETWORK].next, interval, now)) {
-				FILE *fp = popen("ip route show default 2>/dev/null | grep -q default && echo 1 || echo 0", "r");
-				char buf[4] = {0};
-				if (fp) {
-					if (fgets(buf, sizeof buf, fp))
-						net_connected = buf[0] == '1';
-					pclose(fp);
-				} else {
-					net_connected = 0;
+				char buf[4096];
+				int has = 0;
+				if (read_file("/proc/net/route", buf, sizeof buf) >= 0) {
+					char *save = NULL;
+					char *line = strtok_r(buf, "\n", &save);
+					/* skip header */
+					if (line)
+						line = strtok_r(NULL, "\n", &save);
+					for (; line; line = strtok_r(NULL, "\n", &save)) {
+						char *p = line;
+						int field = 0;
+						char *fields[11];
+						while (*p && field < 11) {
+							while (*p == ' ' || *p == '\t')
+								p++;
+							if (!*p)
+								break;
+							fields[field++] = p;
+							while (*p && *p != ' ' && *p != '\t')
+								p++;
+							if (*p)
+								*p++ = '\0';
+						}
+						if (field >= 3 && strcmp(fields[1], "00000000") == 0 &&
+						    strcmp(fields[2], "00000000") != 0) {
+							has = 1;
+							break;
+						}
+					}
 				}
+				net_connected = has;
 				net_valid = 1;
 			}
 			if (net_valid) {
@@ -1939,50 +1963,24 @@ build_status(struct outbuf *o, long long now)
 			if (!battery_missing) {
 				if (module_due(&mstate[MOD_BAT].next, interval, now)) {
 					int pct = 0, ch = 0;
-					mstate[MOD_BAT].valid =
-					    get_battery(&pct, &ch) == 0;
-					if (mstate[MOD_BAT].valid) {
+					if (get_battery(&pct, &ch) == 0) {
 						mstate[MOD_BAT].val.i = pct;
-						/* store charging in a simple way by reusing valid logic + symbol; keep pct */
-					}
-					/* cache charging separately by reusing globals is messy; use a small trick */
-					(void)ch;
-					/* better: recompute quickly */
-					get_battery(&mstate[MOD_BAT].val.i,
-					    &ch);
-					if (mstate[MOD_BAT].valid) {
-						if (ch)
-							out_module(o, m->sep_before,
-							    "%s %d%%", SYM_CHARGING,
-							    mstate[MOD_BAT].val.i);
-						else
-							out_module(o, m->sep_before,
-							    "%s %d%%",
-							    battery_symbol(mstate[MOD_BAT].val.i),
-							    mstate[MOD_BAT].val.i);
-						continue;
+						mstate[MOD_BAT].charging = ch;
+						mstate[MOD_BAT].valid = 1;
+					} else {
+						mstate[MOD_BAT].valid = 0;
 					}
 				}
 				if (mstate[MOD_BAT].valid) {
-					int pct = mstate[MOD_BAT].val.i;
-					int ch = 0;
-					char status[64];
-					char path[PATH_MAX];
-					if (battery_dir[0] &&
-					    path_join(path, sizeof path,
-						battery_dir, "status") == 0 &&
-					    read_file(path, status,
-						sizeof status) >= 0) {
-						trim_ws(status);
-						ch = strcmp(status, "Charging") == 0;
-					}
-					if (ch)
+					if (mstate[MOD_BAT].charging)
 						out_module(o, m->sep_before,
-						    "%s %d%%", SYM_CHARGING, pct);
+						    "%s %d%%", SYM_CHARGING,
+						    mstate[MOD_BAT].val.i);
 					else
 						out_module(o, m->sep_before,
 						    "%s %d%%",
-						    battery_symbol(pct), pct);
+						    battery_symbol(mstate[MOD_BAT].val.i),
+						    mstate[MOD_BAT].val.i);
 				}
 				break;
 			}
