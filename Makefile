@@ -22,7 +22,7 @@ WAYLAND_PROTOCOLS ?= /usr/share/wayland-protocols
 
 PROTO = protocols/wlr-layer-shell-unstable-v1
 XDG   = protocols/xdg-shell
-SRC   = pluto-bar.c drw.c
+SRC   = pluto-bar.c drw.c backend.c backend-hyprland.c backend-river.c
 OBJ   = $(SRC:.c=.o) $(PROTO)-protocol.o $(XDG)-protocol.o
 STATUS_SRC = pluto-status.c
 
@@ -34,8 +34,11 @@ pluto-bar: $(OBJ)
 pluto-status: $(STATUS_SRC:.c=.o)
 	$(CC) -o $@ $(STATUS_SRC:.c=.o) $(LDFLAGS) $(STATUS_LDLIBS)
 
-pluto-bar.o drw.o $(PROTO)-protocol.o $(XDG)-protocol.o: CFLAGS += $(BAR_CFLAGS)
-pluto-bar.o: config.h drw.h $(PROTO)-client-protocol.h
+pluto-bar.o drw.o backend.o backend-hyprland.o backend-river.o \
+$(PROTO)-protocol.o $(XDG)-protocol.o: CFLAGS += $(BAR_CFLAGS)
+pluto-bar.o: config.h bar.h backend.h drw.h $(PROTO)-client-protocol.h
+backend.o: backend.h bar.h drw.h
+backend-hyprland.o backend-river.o: backend.h bar.h drw.h
 pluto-status.o: CFLAGS += $(STATUS_CFLAGS)
 pluto-status.o: status-config.h
 drw.o: drw.h $(PROTO)-client-protocol.h

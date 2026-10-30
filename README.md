@@ -63,3 +63,25 @@ clock are read directly from `/proc`, `/sys`, or the kernel.  Their refresh
 rates are independent; slow-changing modules default to longer intervals.
 Bluetooth and power-profile helpers are queried infrequently and cached when
 their hardware or helper exists.
+
+Compositor backends
+-------------------
+
+`pluto-bar` is split into a Wayland/drawing core and one backend per
+compositor.  The core lives in `pluto-bar.c`; it never talks to a compositor
+directly.  Backends live in `backend-*.c` and only fill in monitor state
+(tags, focus, title, layout) through the small API in `bar.h`.
+
+`backend.c` is the only list of backends.  It selects the first backend whose
+`detect()` succeeds, using the order in its `backends[]` array.
+
+To add a compositor:
+
+1. copy `backend-river.c` to `backend-foo.c` and implement `struct Backend`;
+2. declare it and add it to `backends[]` in `backend.c`;
+3. add `backend-foo.c` to `SRC` in the Makefile.
+
+Removing one is the reverse.  Nothing in `config.h`, the drawing code, or the
+status path changes.  A backend that only needs an environment variable or a
+socket can skip the `global()` hook; one that needs a Wayland global can set
+its detection flag there.
