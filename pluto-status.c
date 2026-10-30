@@ -75,43 +75,27 @@ static int cpu_sampled;
 static char mod_enabled[MOD_COUNT];
 static char mod_available[MOD_COUNT];
 
-/* per-module sampling state */
-static long long cpu_next;
-static int cpu_value;
-static int cpu_valid;
+struct module_state {
+	long long next;
+	int valid;
+	union {
+		int i;
+		unsigned long long ull;
+		const char *sym;
+		char str[128];
+	} val;
+};
+static struct module_state mstate[MOD_COUNT];
 
-static long long ram_next;
-static int ram_value;
-static int ram_valid;
-
-static long long home_next;
-static unsigned long long home_value;
-static int home_valid;
-
-static long long uptime_next;
-static unsigned long long uptime_value;
-static int uptime_valid;
-
+/* wifi-specific state that doesn't map cleanly */
 static long long wifi_sample_next;
 static const char *wifi_symbol;
-static int wifi_valid;
 static int wifi_failures;
 static long long wifi_next;
+static int wifi_valid;
 
-static long long temp_next;
-static int temp_value;
-static int temp_valid;
 static int temp_missing;
-
-static long long battery_next;
-static int battery_pct;
-static int battery_charging;
-static int battery_valid;
 static int battery_missing;
-
-static long long brightness_next;
-static int brightness_value;
-static int brightness_valid;
 static int brightness_missing;
 
 static long long audio_next;
@@ -122,9 +106,7 @@ static int source_value = -1;
 static int source_muted;
 static int source_valid;
 
-static char clock_value[128];
-static int clock_valid;
-static long long clock_next;
+
 
 /* event wakeup pipe for audio and music threads */
 static int wake_pipe[2] = { -1, -1 };
@@ -2094,36 +2076,50 @@ build_status(struct outbuf *o, long long now)
 
 		switch (m->id) {
 		case MOD_CPU:
-			if (module_due(&cpu_next, interval, now)) {
-				cpu_value = get_cpu();
-				cpu_valid = cpu_value >= 0;
+			if (module_due(&mstate[MOD_CPU].next, interval, now)) {
+				int v = get_cpu();
+				mstate[MOD_CPU].val.i = v;
+				mstate[MOD_CPU].valid = v >= 0;
 			}
-			if (cpu_valid)
+			if (mstate[MOD_CPU].valid)
 				out_module(o, m->sep_before, "%s %d%%",
-				    sym ? sym : SYM_CPU, cpu_value);
+				    sym ? sym : SYM_CPU, mstate[MOD_CPU].val.i);
 			break;
 		case MOD_RAM:
-			if (module_due(&ram_next, interval, now)) {
-				ram_value = get_ram();
-				ram_valid = ram_value >= 0;
+			if (module_due(&mstate[MOD_RAM].next, interval, now)) {
+				int v = get_ram();
+				mstate[MOD_RAM].val.i = v;
+				mstate[MOD_RAM].valid = v >= 0;
 			}
-			if (ram_valid)
+			if (mstate[MOD_RAM].valid)
 				out_module(o, m->sep_before, "%s %d%%",
-				    sym ? sym : SYM_RAM, ram_value);
+				    sym ? sym : SYM_RAM, mstate[MOD_RAM].val.i);
 			break;
 		case MOD_HOME:
-			if (module_due(&home_next, interval, now))
-				home_valid = get_home_gb(&home_value) == 0;
-			if (home_valid)
+			if (module_due(&mstate[MOD_HOME].next, interval, now)) {
+				unsigned long long g = 0;
+				mstate[MOD_HOME].valid =
+				    get_home_gb(&g) == 0;
+				if (mstate[MOD_HOME].valid)
+					mstate[MOD_HOME].val.ull = g;
+			}
+			if (mstate[MOD_HOME].valid)
 				out_module(o, m->sep_before, "%s %lluG",
-				    sym ? sym : SYM_HOME, home_value);
+				    sym ? sym : SYM_HOME,
+				    mstate[MOD_HOME].val.ull);
 			break;
 		case MOD_UPTIME:
-			if (module_due(&uptime_next, interval, now))
-				uptime_valid = get_uptime_hours(&uptime_value) == 0;
-			if (uptime_valid)
+			if (module_due(&mstate[MOD_UPTIME].next, interval, now)) {
+				unsigned long long h = 0;
+				mstate[MOD_UPTIME].valid =
+				    get_uptime_hours(&h) == 0;
+				if (mstate[MOD_UPTIME].valid)
+					mstate[MOD_UPTIME].val.ull = h;
+			}
+			if (mstate[MOD_UPTIME].valid)
 				out_module(o, m->sep_before, "%s %lluh",
-				    sym ? sym : SYM_UPTIME, uptime_value);
+				    sym ? sym : SYM_UPTIME,
+				    mstate[MOD_UPTIME].val.ull);
 			break;
 		case MOD_WIFI:
 			if (wlan_if[0]) {
@@ -2148,17 +2144,19 @@ build_status(struct outbuf *o, long long now)
 			break;
 		case MOD_TEMP:
 			if (!temp_missing) {
-				if (module_due(&temp_next, interval, now)) {
-					if (get_temp(&temp_value) == 0)
-						temp_valid = 1;
-					else {
-						temp_value = -1;
-						temp_valid = 0;
+				if (module_due(&mstate[MOD_TEMP].next, interval, now)) {
+					int v = -1;
+					if (get_temp(&v) == 0) {
+						mstate[MOD_TEMP].val.i = v;
+						mstate[MOD_TEMP].valid = 1;
+					} else {
+						mstate[MOD_TEMP].valid = 0;
 					}
 				}
-				if (temp_valid)
+				if (mstate[MOD_TEMP].valid)
 					out_module(o, m->sep_before, "%s %d°C",
-					    sym ? sym : SYM_TEMP, temp_value);
+					    sym ? sym : SYM_TEMP,
+					    mstate[MOD_TEMP].val.i);
 			}
 			break;
 		case MOD_VOL:
@@ -2188,32 +2186,67 @@ build_status(struct outbuf *o, long long now)
 			break;
 		case MOD_BAT:
 			if (!battery_missing) {
-				if (module_due(&battery_next, interval, now))
-					battery_valid = get_battery(&battery_pct,
-					    &battery_charging) == 0;
-				if (battery_valid) {
-					if (battery_charging)
+				if (module_due(&mstate[MOD_BAT].next, interval, now)) {
+					int pct = 0, ch = 0;
+					mstate[MOD_BAT].valid =
+					    get_battery(&pct, &ch) == 0;
+					if (mstate[MOD_BAT].valid) {
+						mstate[MOD_BAT].val.i = pct;
+						/* store charging in a simple way by reusing valid logic + symbol; keep pct */
+					}
+					/* cache charging separately by reusing globals is messy; use a small trick */
+					(void)ch;
+					/* better: recompute quickly */
+					get_battery(&mstate[MOD_BAT].val.i,
+					    &ch);
+					if (mstate[MOD_BAT].valid) {
+						if (ch)
+							out_module(o, m->sep_before,
+							    "%s %d%%", SYM_CHARGING,
+							    mstate[MOD_BAT].val.i);
+						else
+							out_module(o, m->sep_before,
+							    "%s %d%%",
+							    battery_symbol(mstate[MOD_BAT].val.i),
+							    mstate[MOD_BAT].val.i);
+						continue;
+					}
+				}
+				if (mstate[MOD_BAT].valid) {
+					int pct = mstate[MOD_BAT].val.i;
+					int ch = 0;
+					char status[64];
+					char path[PATH_MAX];
+					if (battery_dir[0] &&
+					    path_join(path, sizeof path,
+						battery_dir, "status") == 0 &&
+					    read_file(path, status,
+						sizeof status) >= 0) {
+						trim_ws(status);
+						ch = strcmp(status, "Charging") == 0;
+					}
+					if (ch)
 						out_module(o, m->sep_before,
-						    "%s %d%%", SYM_CHARGING,
-						    battery_pct);
+						    "%s %d%%", SYM_CHARGING, pct);
 					else
 						out_module(o, m->sep_before,
 						    "%s %d%%",
-						    battery_symbol(battery_pct),
-						    battery_pct);
+						    battery_symbol(pct), pct);
 				}
+				break;
 			}
 			break;
 		case MOD_BRIGHT:
 			if (!brightness_missing) {
-				if (module_due(&brightness_next, interval, now)) {
-					brightness_value = get_brightness();
-					brightness_valid = brightness_value >= 0;
+				if (module_due(&mstate[MOD_BRIGHT].next, interval, now)) {
+					int v = get_brightness();
+					mstate[MOD_BRIGHT].val.i = v;
+					mstate[MOD_BRIGHT].valid = v >= 0;
 				}
-				if (brightness_valid)
+				if (mstate[MOD_BRIGHT].valid)
 					out_module(o, m->sep_before, "%s %d%%",
 					    sym ? sym : SYM_BRIGHTNESS,
-					    brightness_value);
+					    mstate[MOD_BRIGHT].val.i);
 			}
 			break;
 		case MOD_SONG:
@@ -2251,13 +2284,16 @@ build_status(struct outbuf *o, long long now)
 			}
 			break;
 		case MOD_CLOCK:
-			if (module_due(&clock_next, interval, now)) {
-				get_clock(clock_value, sizeof clock_value);
-				clock_valid = clock_value[0] != '\0';
-				clock_next = next_clock_ms(now);
+			if (module_due(&mstate[MOD_CLOCK].next, interval, now)) {
+				get_clock(mstate[MOD_CLOCK].val.str,
+				    sizeof mstate[MOD_CLOCK].val.str);
+				mstate[MOD_CLOCK].valid =
+				    mstate[MOD_CLOCK].val.str[0] != '\0';
+				mstate[MOD_CLOCK].next = next_clock_ms(now);
 			}
-			if (clock_valid)
-				out_module(o, m->sep_before, "%s", clock_value);
+			if (mstate[MOD_CLOCK].valid)
+				out_module(o, m->sep_before, "%s",
+				    mstate[MOD_CLOCK].val.str);
 			break;
 		default:
 			break;
@@ -2273,31 +2309,28 @@ next_due_ms(void)
 
 	for (i = 0; i < (sizeof MODULES / sizeof MODULES[0]); i++) {
 		const struct module *m = &MODULES[i];
-		int interval;
 
 		if (m->id < 0 || m->id >= MOD_COUNT)
 			continue;
 		if (!mod_enabled[m->id])
 			continue;
 
-		interval = m->interval > 0 ? m->interval : module_interval(m->id);
-
 		switch (m->id) {
 		case MOD_CPU:
-			if (cpu_next < next)
-				next = cpu_next;
+			if (mstate[MOD_CPU].next < next)
+				next = mstate[MOD_CPU].next;
 			break;
 		case MOD_RAM:
-			if (ram_next < next)
-				next = ram_next;
+			if (mstate[MOD_RAM].next < next)
+				next = mstate[MOD_RAM].next;
 			break;
 		case MOD_HOME:
-			if (home_next < next)
-				next = home_next;
+			if (mstate[MOD_HOME].next < next)
+				next = mstate[MOD_HOME].next;
 			break;
 		case MOD_UPTIME:
-			if (uptime_next < next)
-				next = uptime_next;
+			if (mstate[MOD_UPTIME].next < next)
+				next = mstate[MOD_UPTIME].next;
 			break;
 		case MOD_WIFI:
 			if (wlan_if[0]) {
@@ -2308,8 +2341,8 @@ next_due_ms(void)
 			}
 			break;
 		case MOD_TEMP:
-			if (!temp_missing && temp_next < next)
-				next = temp_next;
+			if (!temp_missing && mstate[MOD_TEMP].next < next)
+				next = mstate[MOD_TEMP].next;
 			break;
 		case MOD_VOL:
 		case MOD_MIC:
@@ -2317,12 +2350,12 @@ next_due_ms(void)
 				next = audio_next;
 			break;
 		case MOD_BAT:
-			if (!battery_missing && battery_next < next)
-				next = battery_next;
+			if (!battery_missing && mstate[MOD_BAT].next < next)
+				next = mstate[MOD_BAT].next;
 			break;
 		case MOD_BRIGHT:
-			if (!brightness_missing && brightness_next < next)
-				next = brightness_next;
+			if (!brightness_missing && mstate[MOD_BRIGHT].next < next)
+				next = mstate[MOD_BRIGHT].next;
 			break;
 		case MOD_SONG:
 			if (have_playerctl) {
@@ -2335,13 +2368,12 @@ next_due_ms(void)
 			}
 			break;
 		case MOD_CLOCK:
-			if (clock_next < next)
-				next = clock_next;
+			if (mstate[MOD_CLOCK].next < next)
+				next = mstate[MOD_CLOCK].next;
 			break;
 		default:
 			break;
 		}
-		(void)interval;
 	}
 
 	if (next == LLONG_MAX)
