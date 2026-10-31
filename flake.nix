@@ -25,14 +25,15 @@
             cairo
             pango
             fontconfig
+            libpulseaudio
           ];
 
           shellHook = ''
             export WLR_PROTOCOLS="${pkgs.wlr-protocols}/share/wlr-protocols"
             export WAYLAND_PROTOCOLS="${pkgs.wayland-protocols}/share/wayland-protocols"
             echo "pluto-bar dev shell"
-            echo "  make          build"
-            echo "  ./pluto-bar   run (needs a Hyprland or river session)"
+            echo "  make          build pluto-bar and pluto-status"
+            echo "  ./pluto-status | ./pluto-bar   run (needs a Hyprland or river session)"
           '';
         };
       });
@@ -57,6 +58,7 @@
             cairo
             pango
             fontconfig
+            libpulseaudio
           ];
 
           makeFlags = [
@@ -71,7 +73,7 @@
           installPhase = ''
             runHook preInstall
             install -Dm755 pluto-bar $out/bin/pluto-bar
-            install -Dm755 status.sh $out/bin/pluto-status
+            install -Dm755 pluto-status $out/bin/pluto-status
             runHook postInstall
           '';
 

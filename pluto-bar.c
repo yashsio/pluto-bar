@@ -11,6 +11,10 @@
  * under river 0.4+, from pluto's small status socket.  River 0.4 has no
  * client-facing status protocol; tags and window management belong to the
  * window manager, so the WM has to publish them.
+ *
+ * Compositor-specific code lives in backend-*.c behind backend.h.  This file
+ * only draws the bar, owns the layer surfaces, and feeds compositor state
+ * into the monitor list.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -23,9 +27,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/socket.h>
 #include <sys/timerfd.h>
-#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -34,6 +36,8 @@
 
 #include "wlr-layer-shell-unstable-v1-client-protocol.h"
 
+#include "bar.h"
+#include "backend.h"
 #include "config.h"
 #include "drw.h"
 
@@ -42,28 +46,7 @@
 #define MIN(a, b) ((a) < (b) ? (a) : (b))
 #endif
 
-typedef struct Monitor Monitor;
-struct Monitor {
-	char name[64];
-	uint32_t global_id;
-	struct wl_output *output;
-	int scale;
-	struct wl_surface *surface;
-	struct zwlr_layer_surface_v1 *layer;
-	struct wl_buffer *buffer;
-	void *data;
-	size_t size;
-	Drw *drw;
-	int width, height;
-	int configured;
-	unsigned int tagset;      /* bit i = tag i is selected */
-	unsigned int occ;         /* bit i = tag i has clients */
-	int focused;
-	int floating;
-	char title[512];
-	char ltsym[16];           /* river/pluto layout symbol, else ltsymbol */
-	Monitor *next;
-};
+_Static_assert(LENGTH(tags) <= MAX_TAGS, "too many tags");
 
 /* dwm's globals */
 static int bh;                    /* bar height */
@@ -71,6 +54,7 @@ static int lrpad;                 /* left/right padding for text */
 static char stext[512];           /* status text */
 static Clr **scheme;
 static int running = 1;
+static int timer_fd = -1;
 
 /* wayland */
 static struct wl_display *dpy;
@@ -87,30 +71,8 @@ static int ready;                 /* initial roundtrips done */
 static Monitor *ptr_mon;
 static int ptr_x;
 
-/* compositor backend */
-enum Backend {
-	BackendNone,
-	BackendHyprland,
-	BackendRiver,
-};
-
-static enum Backend backend;
-static int river_available;       /* river globals seen on the registry */
-
-/* hyprland ipc */
-static int hypr_available;
-static char hypr_sockdir[256];
-static int hypr_fd = -1;
-static char hypr_line[4096];
-static size_t hypr_line_len;
-static int dirty;
-
-/* river/pluto ipc */
-static char river_sockpath[256];
-static int river_fd = -1;
-static int river_in_snapshot;
-static char river_line[4096];
-static size_t river_line_len;
+/* compositor backend (selected by backend.c) */
+static int sync_requested;
 
 /* status input */
 static int stdin_open;
@@ -119,7 +81,6 @@ static char stdin_line[512];
 static size_t stdin_line_len;
 
 static void draw_bar(Monitor *m);
-static void sync_state(void);
 static void create_bar(Monitor *m);
 static void free_bar(Monitor *m);
 static const struct wl_seat_listener seat_listener;
@@ -144,534 +105,134 @@ draw_all(void)
 		draw_bar(m);
 }
 
+/* Only the focused monitor displays the status text, so a status-only
+ * update has no reason to repaint the other monitors. */
+static void
+draw_status(void)
+{
+	Monitor *m;
+
+	for (m = mons; m; m = m->next)
+		if (m->focused)
+			draw_bar(m);
+}
+
 /* -------------------------------------------------------------------------
- * Hyprland IPC
+ * Services used by compositor backends
  * ------------------------------------------------------------------------- */
 
-static void
-hypr_init(void)
+Monitor *
+bar_monitors(void)
 {
-	const char *runtime = getenv("XDG_RUNTIME_DIR");
-	const char *sig = getenv("HYPRLAND_INSTANCE_SIGNATURE");
-	int n;
-
-	if (!runtime || !sig)
-		return;
-
-	n = snprintf(hypr_sockdir, sizeof hypr_sockdir, "%s/hypr/%s", runtime, sig);
-	if (n < 0 || (size_t)n >= sizeof hypr_sockdir) {
-		fprintf(stderr, "pluto-bar: Hyprland socket path is too long\n");
-		return;
-	}
-	hypr_available = 1;
+	return mons;
 }
 
-static int
-hypr_fill_addr(struct sockaddr_un *addr, const char *sockname)
+Monitor *
+bar_find_monitor(const char *name)
 {
-	size_t dlen = strlen(hypr_sockdir);
-	size_t slen = strlen(sockname);
-
-	memset(addr, 0, sizeof *addr);
-	addr->sun_family = AF_UNIX;
-	if (dlen + slen + 1 > sizeof addr->sun_path)
-		return -1;
-	memcpy(addr->sun_path, hypr_sockdir, dlen);
-	memcpy(addr->sun_path + dlen, sockname, slen + 1);
-
-	return 0;
-}
-
-static char *
-hypr_request(const char *cmd)
-{
-	struct sockaddr_un addr;
-	char *buf;
-	size_t len = 0, cap = 4096;
-	ssize_t n;
-	int fd;
-
-	if (!hypr_available)
-		return NULL;
-
-	fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-	if (fd < 0)
-		return NULL;
-
-	if (hypr_fill_addr(&addr, "/.socket.sock") < 0 ||
-	    connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
-		close(fd);
-		return NULL;
-	}
-
-	if (write(fd, cmd, strlen(cmd)) < 0) {
-		close(fd);
-		return NULL;
-	}
-
-	buf = malloc(cap);
-	if (!buf) {
-		close(fd);
-		return NULL;
-	}
-
-	for (;;) {
-		if (len + 2048 + 1 > cap) {
-			char *nb;
-
-			cap *= 2;
-			nb = realloc(buf, cap);
-			if (!nb) {
-				free(buf);
-				close(fd);
-				return NULL;
-			}
-			buf = nb;
-		}
-		n = read(fd, buf + len, cap - len - 1);
-		if (n < 0) {
-			if (errno == EINTR)
-				continue;
-			break;
-		}
-		if (n == 0)
-			break;
-		len += n;
-	}
-	close(fd);
-	buf[len] = '\0';
-
-	return buf;
-}
-
-struct ws_info {
-	int id;
-	int windows;
-	char monitor[64];
-};
-
-struct mon_info {
-	char name[64];
-	int active;
-	int focused;
-};
-
-static void
-hypr_sync_state(void)
-{
-#define MAXWS 64
-#define MAXMON 16
-	char *wsreply, *monreply, *winreply;
-	struct ws_info ws[MAXWS];
-	struct mon_info mos[MAXMON];
-	int nws = 0, nmos = 0, haswin = 0;
-	int floating = 0;
-	char title[512] = "";
 	Monitor *m;
-	int i;
 
-	wsreply = hypr_request("workspaces");
-	monreply = hypr_request("monitors");
-	winreply = hypr_request("activewindow");
+	for (m = mons; m; m = m->next)
+		if (strcmp(m->name, name) == 0)
+			return m;
+	return NULL;
+}
 
-	if (wsreply) {
-		char *save = NULL, *line;
-		struct ws_info *cur = NULL;
+size_t
+bar_tag_count(void)
+{
+	return LENGTH(tags);
+}
 
-		for (line = strtok_r(wsreply, "\n", &save); line;
-		     line = strtok_r(NULL, "\n", &save)) {
-			int id;
+void
+bar_apply_monitor(Monitor *m, const struct MonitorState *state)
+{
+	m->tagset = state->tagset;
+	m->occ = state->occ;
+	m->focused = state->focused;
+	m->floating = state->floating;
+	snprintf(m->title, sizeof m->title, "%s",
+	    state->title ? state->title : "");
+	snprintf(m->ltsym, sizeof m->ltsym, "%s",
+	    state->layout && state->layout[0] &&
+	    strcmp(state->layout, "-") != 0 ? state->layout : ltsymbol);
+}
 
-			if (sscanf(line, "workspace ID %d", &id) == 1) {
-				if (nws < MAXWS) {
-					cur = &ws[nws++];
-					memset(cur, 0, sizeof *cur);
-					cur->id = id;
-					char *p = strstr(line, " on monitor ");
-					if (p)
-						sscanf(p + 12, "%63[^:]", cur->monitor);
-				} else {
-					cur = NULL;
-				}
-			} else if (cur) {
-				int w;
+void
+bar_reset_monitor(Monitor *m)
+{
+	struct MonitorState state = { 0 };
 
-				if (sscanf(line, " windows: %d", &w) == 1)
-					cur->windows = w;
-			}
-		}
-	}
+	state.title = "";
+	bar_apply_monitor(m, &state);
+}
 
-	if (monreply) {
-		char *save = NULL, *line;
-		struct mon_info *cur = NULL;
+void
+bar_reset_monitors(void)
+{
+	Monitor *m;
 
-		for (line = strtok_r(monreply, "\n", &save); line;
-		     line = strtok_r(NULL, "\n", &save)) {
-			char name[64];
-			int id, active;
+	for (m = mons; m; m = m->next)
+		bar_reset_monitor(m);
+}
 
-			if (sscanf(line, "Monitor %63s (ID %d)", name, &id) == 2) {
-				if (nmos < MAXMON) {
-					cur = &mos[nmos++];
-					memset(cur, 0, sizeof *cur);
-					snprintf(cur->name, sizeof cur->name, "%s", name);
-				} else {
-					cur = NULL;
-				}
-			} else if (cur) {
-				if (sscanf(line, " active workspace: %d", &active) == 1)
-					cur->active = active;
-				else if (strstr(line, "focused: yes"))
-					cur->focused = 1;
-			}
-		}
-	}
-
-	if (winreply && strncmp(winreply, "Window ", 7) == 0) {
-		char *save = NULL, *line;
-
-		haswin = 1;
-		for (line = strtok_r(winreply, "\n", &save); line;
-		     line = strtok_r(NULL, "\n", &save)) {
-			if (sscanf(line, " floating: %d", &floating) == 1)
-				continue;
-			if (sscanf(line, " title: %511[^\n]", title) == 1)
-				break;
-		}
-	}
-
-	for (m = mons; m; m = m->next) {
-		m->focused = 0;
-		m->floating = 0;
-		m->tagset = 0;
-		m->occ = 0;
-		m->title[0] = '\0';
-
-		for (i = 0; i < nmos; i++) {
-			if (strcmp(mos[i].name, m->name) != 0)
-				continue;
-			m->focused = mos[i].focused;
-			if (mos[i].active >= 1 && mos[i].active <= (int)LENGTH(tags))
-				m->tagset = 1u << (mos[i].active - 1);
-		}
-
-		for (i = 0; i < nws; i++) {
-			int tag = ws[i].id - 1;
-
-			if (tag < 0 || tag >= (int)LENGTH(tags))
-				continue;
-			if (ws[i].windows > 0 && strcmp(ws[i].monitor, m->name) == 0)
-				m->occ |= 1u << tag;
-		}
-
-		if (m->focused && haswin) {
-			snprintf(m->title, sizeof m->title, "%s", title);
-			m->floating = floating;
-		}
-	}
-
-	free(wsreply);
-	free(monreply);
-	free(winreply);
-
+void
+bar_redraw(void)
+{
 	draw_all();
-#undef MAXWS
-#undef MAXMON
 }
 
-static int
-hypr_connect(void)
+void
+bar_request_sync(void)
 {
-	struct sockaddr_un addr;
-	int fd;
-
-	if (!hypr_available)
-		return -1;
-
-	fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-	if (fd < 0)
-		return -1;
-
-	if (hypr_fill_addr(&addr, "/.socket2.sock") < 0 ||
-	    connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
-		close(fd);
-		return -1;
-	}
-
-	return fd;
+	sync_requested = 1;
 }
 
-static int
-is_state_event(const char *line)
+int
+bar_take_sync_request(void)
 {
-	static const char *names[] = {
-		"workspace", "workspacev2",
-		"focusedmon", "focusedmonv2",
-		"createworkspace", "createworkspacev2",
-		"destroyworkspace", "destroyworkspacev2",
-		"moveworkspace", "moveworkspacev2",
-		"renameworkspace", "activespecial", "activespecialv2",
-		"activewindow", "activewindowv2", "windowtitle",
-		"openwindow", "closewindow", "movewindow",
-		"monitoradded", "monitoraddedv2", "monitorremoved",
-		"configreloaded",
-	};
-	size_t n = strcspn(line, ">");
-	size_t i;
+	int requested = sync_requested;
 
-	for (i = 0; i < LENGTH(names); i++)
-		if (strlen(names[i]) == n && strncmp(line, names[i], n) == 0)
-			return 1;
-
-	return 0;
+	sync_requested = 0;
+	return requested;
 }
 
 static void
-hypr_read_events(void)
+bar_timer_arm(int ms)
 {
-	char buf[4096];
-	ssize_t n;
-	size_t i;
+	struct itimerspec its;
 
-	for (;;) {
-		n = read(hypr_fd, buf, sizeof buf);
-		if (n > 0) {
-			for (i = 0; i < (size_t)n; i++) {
-				if (buf[i] == '\n') {
-					hypr_line[hypr_line_len] = '\0';
-					if (hypr_line_len && is_state_event(hypr_line))
-						dirty = 1;
-					hypr_line_len = 0;
-				} else if (hypr_line_len < sizeof hypr_line - 1) {
-					hypr_line[hypr_line_len++] = buf[i];
-				}
-			}
-		} else if (n == 0) {
-			close(hypr_fd);
-			hypr_fd = -1;
-			hypr_line_len = 0;
-			return;
-		} else {
-			if (errno == EINTR)
-				continue;
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
-				return;
-			close(hypr_fd);
-			hypr_fd = -1;
-			hypr_line_len = 0;
-			return;
-		}
+	memset(&its, 0, sizeof its);
+	if (ms > 0) {
+		its.it_value.tv_sec = ms / 1000;
+		its.it_value.tv_nsec = (long)(ms % 1000) * 1000000L;
+		if (!its.it_value.tv_sec && !its.it_value.tv_nsec)
+			its.it_value.tv_nsec = 1;
 	}
+	if (timer_fd >= 0)
+		timerfd_settime(timer_fd, 0, &its, NULL);
 }
 
-/* -------------------------------------------------------------------------
- * River 0.4 / pluto IPC
- * -------------------------------------------------------------------------
- *
- * River 0.4 has no client-facing status or control protocol: tags are
- * entirely the window manager's business.  pluto publishes per-monitor state
- * on a Unix socket and accepts a single "view" command.  The path matches
- * pluto's ipc.c:
- *
- *     $XDG_RUNTIME_DIR/pluto-<WAYLAND_DISPLAY>.sock
- *
- * and the line format is documented in pluto's ipc.h.
+/*
+ * The clock fallback needs a one-second tick.  Once status comes from
+ * stdin there is nothing to tick; only a disconnected WM socket needs a
+ * slow reconnect retry.  A zero interval leaves poll() asleep.
  */
-
-static int
-river_socket_path(char *buf, size_t size)
+void
+bar_timer_update(void)
 {
-	const char *runtime = getenv("XDG_RUNTIME_DIR");
-	const char *display = getenv("WAYLAND_DISPLAY");
-	char safe[128];
-	size_t i, j = 0;
-	int n;
-
-	if (!runtime || !*runtime)
-		runtime = "/tmp";
-	if (!display || !*display)
-		display = "wayland-0";
-
-	for (i = 0; display[i] && j < sizeof safe - 1; i++) {
-		unsigned char c = display[i];
-
-		if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-		    (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.')
-			safe[j++] = c;
-		else
-			safe[j++] = '_';
-	}
-	safe[j] = '\0';
-
-	n = snprintf(buf, size, "%s/pluto-%s.sock", runtime, safe);
-	return n < 0 || (size_t)n >= size ? -1 : 0;
-}
-
-static int
-river_connect(void)
-{
-	struct sockaddr_un addr;
-	int fd;
-
-	if (!river_available)
-		return -1;
-	if (river_socket_path(river_sockpath, sizeof river_sockpath) < 0)
-		return -1;
-	if (strlen(river_sockpath) >= sizeof addr.sun_path)
-		return -1;
-
-	fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
-	if (fd < 0)
-		return -1;
-
-	memset(&addr, 0, sizeof addr);
-	addr.sun_family = AF_UNIX;
-	memcpy(addr.sun_path, river_sockpath, strlen(river_sockpath) + 1);
-
-	if (connect(fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
-		close(fd);
-		return -1;
-	}
-
-	river_fd = fd;
-	river_line_len = 0;
-	river_in_snapshot = 0;
-	return 0;
-}
-
-static void
-river_send(const char *fmt, ...)
-{
-	char buf[256];
-	va_list ap;
-	int n;
-	size_t off = 0;
-
-	if (river_fd < 0 && river_connect() < 0)
+	if (timer_fd < 0)
 		return;
 
-	va_start(ap, fmt);
-	n = vsnprintf(buf, sizeof buf, fmt, ap);
-	va_end(ap);
-	if (n <= 0)
-		return;
-	if ((size_t)n >= sizeof buf)
-		n = sizeof buf - 1;
-
-	while (off < (size_t)n) {
-		ssize_t written = send(river_fd, buf + off, (size_t)n - off,
-		    MSG_NOSIGNAL);
-
-		if (written < 0) {
-			if (errno == EINTR)
-				continue;
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
-				return;
-			close(river_fd);
-			river_fd = -1;
-			return;
-		}
-		off += (size_t)written;
-	}
-}
-
-static void
-river_reset_monitor(Monitor *m)
-{
-	m->focused = 0;
-	m->floating = 0;
-	m->tagset = 0;
-	m->occ = 0;
-	m->title[0] = '\0';
-	snprintf(m->ltsym, sizeof m->ltsym, "%s", ltsymbol);
-}
-
-static void
-river_handle_line(char *line)
-{
-	Monitor *m;
-	char name[64], layout[16];
-	unsigned int tagset, occ;
-	int focused, floating, off = 0;
-
-	if (strcmp(line, "begin") == 0) {
-		river_in_snapshot = 1;
-		for (m = mons; m; m = m->next)
-			river_reset_monitor(m);
+	if (!status_from_stdin) {
+		bar_timer_arm(1000);
 		return;
 	}
-	if (strcmp(line, "end") == 0) {
-		if (river_in_snapshot)
-			draw_all();
-		river_in_snapshot = 0;
+	if (backend && backend->needs_retry && backend->needs_retry()) {
+		bar_timer_arm(5000);
 		return;
 	}
-	if (!river_in_snapshot)
-		return;
-	if (sscanf(line, "monitor %63s %x %x %15s %d %d %n",
-	    name, &tagset, &occ, layout, &focused, &floating, &off) < 6)
-		return;
-
-	for (m = mons; m; m = m->next) {
-		if (strcmp(m->name, name) != 0)
-			continue;
-		m->tagset = tagset;
-		m->occ = occ;
-		m->focused = focused;
-		m->floating = floating;
-		snprintf(m->ltsym, sizeof m->ltsym, "%s",
-		    strcmp(layout, "-") == 0 ? ltsymbol : layout);
-		snprintf(m->title, sizeof m->title, "%s", line + off);
-		return;
-	}
-}
-
-static void
-river_read_events(void)
-{
-	char buf[4096];
-	ssize_t n;
-	size_t i;
-
-	for (;;) {
-		n = read(river_fd, buf, sizeof buf);
-		if (n > 0) {
-			for (i = 0; i < (size_t)n; i++) {
-				if (buf[i] == '\n') {
-					river_line[river_line_len] = '\0';
-					if (river_line_len)
-						river_handle_line(river_line);
-					river_line_len = 0;
-				} else if (river_line_len < sizeof river_line - 1) {
-					river_line[river_line_len++] = buf[i];
-				}
-			}
-		} else if (n == 0) {
-			close(river_fd);
-			river_fd = -1;
-			river_line_len = 0;
-			river_in_snapshot = 0;
-			return;
-		} else {
-			if (errno == EINTR)
-				continue;
-			if (errno == EAGAIN || errno == EWOULDBLOCK)
-				return;
-			close(river_fd);
-			river_fd = -1;
-			river_line_len = 0;
-			river_in_snapshot = 0;
-			return;
-		}
-	}
-}
-
-static void
-sync_state(void)
-{
-	if (backend == BackendHyprland)
-		hypr_sync_state();
+	bar_timer_arm(0);
 }
 
 /* -------------------------------------------------------------------------
@@ -695,16 +256,19 @@ update_clock(void)
 	if (strcmp(buf, stext) == 0)
 		return;
 	snprintf(stext, sizeof stext, "%s", buf);
-	draw_all();
+	draw_status();
 }
 
 static void
 read_status(void)
 {
 	char buf[1024];
+	char prev[sizeof stext];
 	ssize_t n;
 	size_t i;
 	int got = 0;
+
+	snprintf(prev, sizeof prev, "%s", stext);
 
 	for (;;) {
 		n = read(STDIN_FILENO, buf, sizeof buf);
@@ -741,8 +305,15 @@ read_status(void)
 	}
 
 	if (got) {
+		int first = !status_from_stdin;
+
 		status_from_stdin = 1;
-		draw_all();
+		if (first)
+			bar_timer_update();
+		/* A status generator that prints every second would otherwise
+		 * force a full-width repaint even when the text is unchanged. */
+		if (strcmp(stext, prev) != 0)
+			draw_status();
 	}
 }
 
@@ -766,37 +337,16 @@ static void
 tag_click(Monitor *m, int x)
 {
 	unsigned int i, tx = 0, w;
-	char cmd[128];
 
 	if (!m->drw)
 		return;
 
 	for (i = 0; i < LENGTH(tags); i++) {
-		w = lrpad + drw_text_width(m->drw, tags[i]);
+		w = m->tagw[i];
 		if (x >= (int)tx && x < (int)(tx + w)) {
-			if (!(m->tagset & (1u << i))) {
-				if (backend == BackendRiver) {
-					/* river 0.4: ask the WM to view this tag. */
-					river_send("view %s %x\n", m->name,
-					    1u << i);
-					return;
-				}
-
-				char *r;
-
-				/* Hyprland's Lua config evaluates a dispatch argument
-				 * as Lua; fall back to the legacy syntax on failure. */
-				snprintf(cmd, sizeof cmd,
-				    "dispatch hl.dsp.focus({ workspace = %u })", i + 1);
-				r = hypr_request(cmd);
-				if (r && strstr(r, "error")) {
-					free(r);
-					snprintf(cmd, sizeof cmd,
-					    "dispatch workspace %u", i + 1);
-					r = hypr_request(cmd);
-				}
-				free(r);
-			}
+			if (!(m->tagset & (1u << i)) &&
+			    backend && backend->tag_click)
+				backend->tag_click(m, (int)i);
 			return;
 		}
 		tx += w;
@@ -832,7 +382,7 @@ draw_bar(Monitor *m)
 
 	x = 0;
 	for (i = 0; i < LENGTH(tags); i++) {
-		w = lrpad + drw_text_width(drw, tags[i]);
+		w = m->tagw[i];
 		drw_setscheme(drw,
 		    scheme[(m->tagset & (1u << i)) ? SchemeSel : SchemeNorm]);
 		drw_text(drw, x, 0, w, m->height, lrpad / 2, tags[i], 0);
@@ -885,7 +435,7 @@ static void
 create_buffer(Monitor *m)
 {
 	int pw, ph, stride;
-	size_t size;
+	size_t i, size;
 	struct wl_shm_pool *pool;
 	void *data;
 	int fd;
@@ -923,6 +473,13 @@ create_buffer(Monitor *m)
 
 	wl_surface_set_buffer_scale(m->surface, m->scale);
 	m->drw = drw_create(m->width, m->height, m->scale, data, stride, font);
+
+	/* Tags and font are compile-time constants, so measure them once. */
+	if (m->drw) {
+		for (i = 0; i < LENGTH(tags); i++)
+			m->tagw[i] = lrpad +
+			    drw_text_width(m->drw, tags[i]);
+	}
 }
 
 static void
@@ -1081,6 +638,8 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name,
 {
 	(void)data;
 
+	backend_global(interface, version);
+
 	if (strcmp(interface, wl_compositor_interface.name) == 0) {
 		compositor = wl_registry_bind(reg, name, &wl_compositor_interface,
 		    MIN(version, 4));
@@ -1108,10 +667,6 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name,
 		wl_output_add_listener(m->output, &output_listener, m);
 		m->next = mons;
 		mons = m;
-	} else if (strcmp(interface, "river_layer_shell_v1") == 0 ||
-	    strcmp(interface, "river_window_manager_v1") == 0) {
-		/* River 0.4: state comes from the WM over its IPC socket. */
-		river_available = 1;
 	}
 }
 
@@ -1257,24 +812,18 @@ static const struct wl_seat_listener seat_listener = {
 static void
 tick(void)
 {
-	if (backend == BackendHyprland && !hypr_fd && hypr_available) {
-		hypr_fd = hypr_connect();
-		if (hypr_fd >= 0)
-			dirty = 1;
-	}
-
-	if (backend == BackendRiver && river_fd < 0)
-		river_connect();
+	if (backend && backend->tick)
+		backend->tick();
 
 	update_clock();
+	bar_timer_update();
 }
 
 int
 main(void)
 {
-	struct itimerspec its;
 	struct pollfd fds[5];
-	int timer_fd, nfds, i;
+	int nfds, i, bfd, backend_idx;
 	Monitor *m;
 	int font_h;
 
@@ -1290,8 +839,6 @@ main(void)
 	for (i = 0; i < (int)LENGTH(colors); i++)
 		scheme[i] = drw_scm_create(colors[i], 2);
 
-	hypr_init();
-
 	dpy = wl_display_connect(NULL);
 	if (!dpy)
 		die("pluto-bar: cannot connect to Wayland display\n");
@@ -1306,15 +853,10 @@ main(void)
 	if (!compositor || !shm || !layer_shell)
 		die("pluto-bar: compositor is missing wl_compositor, wl_shm or wlr-layer-shell\n");
 
-	if (hypr_available)
-		backend = BackendHyprland;
-	else if (river_available)
-		backend = BackendRiver;
-	else {
-		backend = BackendNone;
-		fprintf(stderr, "pluto-bar: warning: neither Hyprland nor river "
+	backend_select();
+	if (!backend)
+		fprintf(stderr, "pluto-bar: warning: no supported compositor "
 		    "was detected; tags will not update\n");
-	}
 
 	ready = 1;
 	i = 0;
@@ -1334,24 +876,17 @@ main(void)
 	timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
 	if (timer_fd < 0)
 		die("pluto-bar: timerfd_create: %s\n", strerror(errno));
-	its.it_value.tv_sec = 1;
-	its.it_value.tv_nsec = 0;
-	its.it_interval = its.it_value;
-	if (timerfd_settime(timer_fd, 0, &its, NULL) < 0)
-		die("pluto-bar: timerfd_settime: %s\n", strerror(errno));
+	bar_timer_arm(1000);
 
-	if (backend == BackendHyprland) {
-		hypr_fd = hypr_connect();
-		if (hypr_fd < 0)
-			fprintf(stderr, "pluto-bar: warning: cannot connect to Hyprland event socket\n");
-	} else if (backend == BackendRiver) {
-		if (river_connect() < 0)
-			fprintf(stderr, "pluto-bar: warning: cannot connect to "
-			    "pluto IPC socket; will keep retrying\n");
+	if (backend) {
+		if (backend->connect && backend->connect() < 0)
+			fprintf(stderr, "pluto-bar: warning: cannot connect to %s; "
+			    "will keep retrying\n", backend->name);
 	}
 
 	update_clock();
-	sync_state();
+	if (backend && backend->sync)
+		backend->sync();
 
 	while (running) {
 		wl_display_dispatch_pending(dpy);
@@ -1362,14 +897,11 @@ main(void)
 		fds[nfds].events = POLLIN;
 		nfds++;
 
-		if (hypr_fd >= 0) {
-			fds[nfds].fd = hypr_fd;
-			fds[nfds].events = POLLIN;
-			nfds++;
-		}
-
-		if (river_fd >= 0) {
-			fds[nfds].fd = river_fd;
+		bfd = backend_fd();
+		backend_idx = -1;
+		if (bfd >= 0) {
+			backend_idx = nfds;
+			fds[nfds].fd = bfd;
 			fds[nfds].events = POLLIN;
 			nfds++;
 		}
@@ -1397,10 +929,9 @@ main(void)
 			if (fds[i].fd == wl_display_get_fd(dpy)) {
 				if (wl_display_dispatch(dpy) < 0)
 					running = 0;
-			} else if (hypr_fd >= 0 && fds[i].fd == hypr_fd) {
-				hypr_read_events();
-			} else if (river_fd >= 0 && fds[i].fd == river_fd) {
-				river_read_events();
+			} else if (i == backend_idx) {
+				if (backend->read_events)
+					backend->read_events();
 			} else if (fds[i].fd == timer_fd) {
 				uint64_t exp;
 
@@ -1413,10 +944,8 @@ main(void)
 			}
 		}
 
-		if (dirty) {
-			dirty = 0;
-			sync_state();
-		}
+		if (bar_take_sync_request() && backend && backend->sync)
+			backend->sync();
 	}
 
 	while (mons) {
@@ -1426,10 +955,8 @@ main(void)
 		mons = next;
 	}
 
-	if (hypr_fd >= 0)
-		close(hypr_fd);
-	if (river_fd >= 0)
-		close(river_fd);
+	if (backend && backend->destroy)
+		backend->destroy();
 	close(timer_fd);
 
 	for (i = 0; i < (int)LENGTH(colors); i++)
