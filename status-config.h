@@ -32,7 +32,6 @@ static const char *const GAP = " ";
  *   symbol:   NULL = use default symbol, or set to override
  * ------------------------------------------------------------------------- */
 enum {
-	MOD_SONG,
 	MOD_CPU,
 	MOD_RAM,
 	MOD_HOME,
@@ -41,6 +40,7 @@ enum {
 	MOD_TEMP,
 	MOD_VOL,
 	MOD_MIC,
+  MOD_SONG,
 	MOD_BAT,
 	MOD_BRIGHT,
 	MOD_CLOCK,
@@ -56,18 +56,18 @@ struct module {
 };
 
 static const struct module MODULES[] = {
-	{ MOD_SONG,    NULL,     -1, 1, 0  },
 	{ MOD_CPU,     NULL,      1, 0, 2  },
 	{ MOD_RAM,     NULL,      1, 0, 2  },
 	{ MOD_HOME,    NULL,     -1, 1, 10 },
 	{ MOD_UPTIME,  NULL,     -1, 1, 60 },
 	{ MOD_NETWORK, NULL,     -1, 1, 5  },
 	{ MOD_TEMP,    NULL,     -1, 1, 5  },
-	{ MOD_VOL,    NULL,     -1, 1, 0  },
-	{ MOD_MIC,    NULL,      0, 0, 0  },
-	{ MOD_BAT,    NULL,     -1, 1, 10 },
-	{ MOD_BRIGHT, NULL,     -1, 0, 2  },
-	{ MOD_CLOCK,  NULL,      1, 1, 60 },
+	{ MOD_VOL,     NULL,     -1, 1, 0  },
+	{ MOD_MIC,     NULL,     -1, 0, 0  },
+  { MOD_SONG,    NULL,     -1, 1, 0  },
+	{ MOD_BAT,     NULL,     -1, 1, 10 },
+	{ MOD_BRIGHT,  NULL,     -1, 0, 2  },
+	{ MOD_CLOCK,   NULL,      1, 1, 60 },
 };
 
 /* battery thresholds (for icon selection) */

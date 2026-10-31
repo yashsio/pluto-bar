@@ -5,7 +5,7 @@
  */
 
 /* appearance */
-static const char font[] = "DejaVu Sans Mono 15px";
+static const char font[] = "monospace 15px";
 /* Labels only.  The tag at index i maps to workspace i + 1 under Hyprland
  * and to pluto's tag i + 1 under river.  dwm has nine tags; Hyprland
  * workspace 10 still exists (mod+0) but has no tag. */
