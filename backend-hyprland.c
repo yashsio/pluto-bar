@@ -149,33 +149,33 @@ hypr_sync(void)
 	monreply = hypr_request("monitors");
 	winreply = hypr_request("activewindow");
 
-	if (wsreply) {
-		char *save = NULL, *line;
-		struct ws_info *cur = NULL;
-
-		for (line = strtok_r(wsreply, "\n", &save); line;
-		     line = strtok_r(NULL, "\n", &save)) {
-			int id;
-
-			if (sscanf(line, "workspace ID %d", &id) == 1) {
-				if (nws < MAXWS) {
-					cur = &ws[nws++];
-					memset(cur, 0, sizeof *cur);
-					cur->id = id;
-					char *p = strstr(line, " on monitor ");
-					if (p)
-						sscanf(p + 12, "%63[^:]", cur->monitor);
-				} else {
-					cur = NULL;
-				}
-			} else if (cur) {
-				int w;
-
-				if (sscanf(line, " windows: %d", &w) == 1)
-					cur->windows = w;
-			}
-		}
-	}
+  if (wsreply) {
+  	char *save = NULL, *line;
+  	struct ws_info *cur = NULL;
+  
+  	for (line = strtok_r(wsreply, "\n", &save); line;
+  	     line = strtok_r(NULL, "\n", &save)) {
+  		int id;
+  		char monitor[64];
+  
+  		if (sscanf(line, "workspace %d (%d) on monitor %63s", &id, &id, monitor) >= 2 ||
+  		    sscanf(line, "workspace %d on monitor %63s", &id, monitor) == 2) {
+  			if (nws < MAXWS) {
+  				cur = &ws[nws++];
+  				memset(cur, 0, sizeof *cur);
+  				cur->id = id;
+  				sscanf(monitor, "%63[^:]", cur->monitor);
+  			} else {
+  				cur = NULL;
+  			}
+  		} else if (cur) {
+  			int w;
+  
+  			if (sscanf(line, "	windows: %d", &w) == 1)
+  				cur->windows = w;
+  		}
+  	}
+  }
 
 	if (monreply) {
 		char *save = NULL, *line;
